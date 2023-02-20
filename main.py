@@ -32,6 +32,7 @@ sns.set_style('darkgrid')
 def main(args, ITE=0):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     reinit = True if args.prune_type=="reinit" else False
+    torch.cuda.manual_seed_all(args.seed)
 
     # Data Loader
     transform=transforms.Compose([transforms.ToTensor(),transforms.Normalize((0.1307,), (0.3081,))])
@@ -61,9 +62,11 @@ def main(args, ITE=0):
         print("\nWrong Dataset choice \n")
         exit()
 
-    train_loader = torch.utils.data.DataLoader(traindataset, batch_size=args.batch_size, shuffle=True, num_workers=0,drop_last=False)
+    train_dataset, val_dataset = torch.utils.data.random_split(traindataset, [55000, 5000], generator=torch.Generator().manual_seed(args.seed))
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
     #train_loader = cycle(train_loader)
-    test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=0,drop_last=True)
+    test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=4,drop_last=True)
     
     # Importing Network Architecture
     global model
@@ -156,7 +159,7 @@ def main(args, ITE=0):
 
             # Frequency for Testing
             if iter_ % args.valid_freq == 0:
-                accuracy = test(model, test_loader, criterion)
+                accuracy = test(model, val_loader, criterion)
 
                 # Save Weights
                 if accuracy > best_accuracy:
@@ -174,7 +177,7 @@ def main(args, ITE=0):
                 pbar.set_description(
                     f'Train Epoch: {iter_}/{args.end_iter} Loss: {loss:.6f} Accuracy: {accuracy:.2f}% Best Accuracy: {best_accuracy:.2f}%')       
 
-        writer.add_scalar('Accuracy/test', best_accuracy, comp1)
+        writer.add_scalar('Accuracy/val', best_accuracy, comp1)
         bestacc[_ite]=best_accuracy
 
         # Plotting Loss (Training), Accuracy (Testing), Iteration Curve
@@ -241,10 +244,17 @@ def train(model, train_loader, optimizer, criterion):
         # Freezing Pruned weights by making their gradients Zero
         for name, p in model.named_parameters():
             if 'weight' in name:
-                tensor = p.data.cpu().numpy()
-                grad_tensor = p.grad.data.cpu().numpy()
-                grad_tensor = np.where(tensor < EPS, 0, grad_tensor)
-                p.grad.data = torch.from_numpy(grad_tensor).to(device)
+
+                # tensor = p.data.cpu().numpy()
+                # grad_tensor = p.grad.data.cpu().numpy()
+                # grad_tensor = np.where(tensor < EPS, 0, grad_tensor)
+                # p.grad.data = torch.from_numpy(grad_tensor).to(device)
+
+                tensor = p.data
+                grad_tensor = p.grad.data
+                grad_tensor = torch.where(tensor < EPS, 0, grad_tensor)
+                p.grad.data = grad_tensor.to(device)
+
         optimizer.step()
     return train_loss.item()
 
@@ -277,16 +287,26 @@ def prune_by_percentile(percent, resample=False, reinit=False,**kwargs):
 
             # We do not prune bias term
             if 'weight' in name:
-                tensor = param.data.cpu().numpy()
-                alive = tensor[np.nonzero(tensor)] # flattened array of nonzero values
-                percentile_value = np.percentile(abs(alive), percent)
+                # tensor = param.data.cpu().numpy()
+                # alive = tensor[np.nonzero(tensor)] # flattened array of nonzero values
+                # percentile_value = np.percentile(abs(alive), percent)
 
-                # Convert Tensors to numpy and calculate
-                weight_dev = param.device
-                new_mask = np.where(abs(tensor) < percentile_value, 0, mask[step])
+                # # Convert Tensors to numpy and calculate
+                # weight_dev = param.device
+                # new_mask = np.where(abs(tensor) < percentile_value, 0, mask[step])
                 
-                # Apply new weight and mask
-                param.data = torch.from_numpy(tensor * new_mask).to(weight_dev)
+                # # Apply new weight and mask
+                # param.data = torch.from_numpy(tensor * new_mask).to(weight_dev)
+
+
+
+                tensor = param.data
+                alive = tensor[torch.nonzero(tensor, as_tuple=True)]
+                percentile_value = torch.quantile(abs(alive), percent)
+                weight_dev = param.device
+                new_mask = torch.where(torch.abs(tensor) < percentile_value, 0, mask[step])
+                param.data = (tensor * new_mask).to(weight_dev)
+
                 mask[step] = new_mask
                 step += 1
         step = 0
@@ -303,8 +323,10 @@ def make_mask(model):
     step = 0
     for name, param in model.named_parameters(): 
         if 'weight' in name:
-            tensor = param.data.cpu().numpy()
-            mask[step] = np.ones_like(tensor)
+            # tensor = param.data.cpu().numpy()
+            # mask[step] = np.ones_like(tensor)
+            tensor = param.data
+            mask[step] = torch.ones_like(tensor)
             step = step + 1
     step = 0
 
@@ -315,7 +337,9 @@ def original_initialization(mask_temp, initial_state_dict):
     for name, param in model.named_parameters(): 
         if "weight" in name: 
             weight_dev = param.device
-            param.data = torch.from_numpy(mask_temp[step] * initial_state_dict[name].cpu().numpy()).to(weight_dev)
+            # param.data = torch.from_numpy(mask_temp[step] * initial_state_dict[name].cpu().numpy()).to(weight_dev)
+
+            param.data = (mask_temp[step] * initial_state_dict[name]).to(weight_dev)
             step = step + 1
         if "bias" in name:
             param.data = initial_state_dict[name]
@@ -392,8 +416,8 @@ def weight_init(m):
 
 if __name__=="__main__":
     
-    #from gooey import Gooey
-    #@Gooey      
+    # from gooey import Gooey
+    # @Gooey      
     
     # Arguement Parser
     parser = argparse.ArgumentParser()
@@ -407,9 +431,10 @@ if __name__=="__main__":
     parser.add_argument("--prune_type", default="lt", type=str, help="lt | reinit")
     parser.add_argument("--gpu", default="0", type=str)
     parser.add_argument("--dataset", default="mnist", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
-    parser.add_argument("--arch_type", default="fc1", type=str, help="fc1 | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
+    parser.add_argument("--arch_type", default="vgg16", type=str, help="fc1 | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
     parser.add_argument("--prune_percent", default=10, type=int, help="Pruning percent")
     parser.add_argument("--prune_iterations", default=35, type=int, help="Pruning iterations count")
+    parser.add_argument("--seed", default=1, type=int)
 
     
     args = parser.parse_args()
