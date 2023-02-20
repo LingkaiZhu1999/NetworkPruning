@@ -28,14 +28,47 @@ writer = SummaryWriter()
 # Plotting Style
 sns.set_style('darkgrid')
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--lr",default= 1.2e-3, type=float, help="Learning rate")
+parser.add_argument("--batch_size", default=60, type=int)
+parser.add_argument("--start_iter", default=0, type=int)
+parser.add_argument("--end_iter", default=100, type=int)
+parser.add_argument("--print_freq", default=1, type=int)
+parser.add_argument("--valid_freq", default=1, type=int)
+parser.add_argument("--resume", action="store_true")
+parser.add_argument("--prune_type", default="lt", type=str, help="lt | reinit")
+parser.add_argument("--gpu", default="0", type=str)
+parser.add_argument("--dataset", default="mnist", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
+parser.add_argument("--arch_type", default="vgg16", type=str, help="fc1 | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
+parser.add_argument("--prune_percent", default=10, type=int, help="Pruning percent")
+parser.add_argument("--prune_iterations", default=35, type=int, help="Pruning iterations count")
+parser.add_argument("--seed", default=1, type=int)
+
+
+args = parser.parse_args()
+
+
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   
+os.environ["CUDA_VISIBLE_DEVICES"]=args.gpu
+    
 # Main
 def main(args, ITE=0):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     reinit = True if args.prune_type=="reinit" else False
     torch.cuda.manual_seed_all(args.seed)
 
+    mean = {
+        'mnist': (0.1307,),
+        'cifar10': (0.4914, 0.4822 ,0.4465),
+        'cifar100': (0.5071, 0.4867, 0.4408)
+    }
+    std = {
+        'mnist': (0.3081,),
+        'cifar10': (0.2470, 0.2435, 0.2616),
+        'cifar100': (0.2675, 0.2565, 0.2761),
+    }
     # Data Loader
-    transform=transforms.Compose([transforms.ToTensor(),transforms.Normalize((0.1307,), (0.3081,))])
+    transform=transforms.Compose([transforms.ToTensor(),transforms.Normalize(mean[args.dataset], std[args.dataset])])
     if args.dataset == "mnist":
         traindataset = datasets.MNIST('../data', train=True, download=True,transform=transform)
         testdataset = datasets.MNIST('../data', train=False, transform=transform)
@@ -142,7 +175,8 @@ def main(args, ITE=0):
                 for name, param in model.named_parameters():
                     if 'weight' in name:
                         weight_dev = param.device
-                        param.data = torch.from_numpy(param.data.cpu().numpy() * mask[step]).to(weight_dev)
+                        param.data = (param.data * mask[step]).to(weight_dev)
+                        # param.data = torch.from_numpy(param.data.cpu().numpy() * mask[step]).to(weight_dev)
                         step = step + 1
                 step = 0
             else:
@@ -420,30 +454,7 @@ if __name__=="__main__":
     # @Gooey      
     
     # Arguement Parser
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--lr",default= 1.2e-3, type=float, help="Learning rate")
-    parser.add_argument("--batch_size", default=60, type=int)
-    parser.add_argument("--start_iter", default=0, type=int)
-    parser.add_argument("--end_iter", default=100, type=int)
-    parser.add_argument("--print_freq", default=1, type=int)
-    parser.add_argument("--valid_freq", default=1, type=int)
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--prune_type", default="lt", type=str, help="lt | reinit")
-    parser.add_argument("--gpu", default="0", type=str)
-    parser.add_argument("--dataset", default="mnist", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
-    parser.add_argument("--arch_type", default="vgg16", type=str, help="fc1 | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
-    parser.add_argument("--prune_percent", default=10, type=int, help="Pruning percent")
-    parser.add_argument("--prune_iterations", default=35, type=int, help="Pruning iterations count")
-    parser.add_argument("--seed", default=1, type=int)
 
-    
-    args = parser.parse_args()
-
-
-    os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   
-    os.environ["CUDA_VISIBLE_DEVICES"]=args.gpu
-    
-    
     #FIXME resample
     resample = False
 
