@@ -32,7 +32,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--lr",default= 0.0003, type=float, help="Learning rate")
 parser.add_argument("--batch_size", default=60, type=int)
 parser.add_argument("--start_prune_round", default=0, type=int)
-parser.add_argument("--train_epochs", default=10000, type=int)
+parser.add_argument("--train_epochs", default=1, type=int)
 parser.add_argument("--print_freq", default=1, type=int)
 parser.add_argument("--valid_freq", default=1, type=int)
 parser.add_argument("--early_stop", default=25, type=int)
@@ -55,7 +55,8 @@ os.environ["CUDA_VISIBLE_DEVICES"]=args.gpu
     
 # Main
 def main(args, ITE=0):
-    
+    global mask 
+
     writer = SummaryWriter(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     reinit = True if args.prune_type=="reinit" else False
@@ -126,15 +127,17 @@ def main(args, ITE=0):
     
     parameters_to_prune = []
     for name, module in model.named_modules():
-        if isinstance(module, nn.Conv2d):
+        if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
             if name == 'conv1':
-                if args.conv1:
+                if args.prune_conv1:
                     parameters_to_prune.append((module, 'weight'))
                 else:
                     print('skip the first conv2d for L1 unstructure global pruning')
             else:
                 parameters_to_prune.append((module, 'weight'))
     parameters_to_prune = tuple(parameters_to_prune)
+
+    mask = [None] * len(parameters_to_prune)
 
     # Weight Initialization
     model.apply(weight_init)
@@ -168,13 +171,13 @@ def main(args, ITE=0):
             print(_ite)
             # prune_percent_each_round = np.power(args.prune_percent, 1/args.prune_rounds) * 0.01 # p^(1/n) %
             # prune_percent_each_round = args.prune_percent * 0.01 / args.prune_rounds 
-            prune.global_unstructured(parameters_to_prune, pruning_method=prune.L1Unstructured, amount=args.prune_percent)
+            prune.global_unstructured(parameters_to_prune, pruning_method=prune.L1Unstructured, amount=args.prune_percent * 0.01)
+            get_mask(mask, parameters_to_prune)
             if reinit:
                 model.apply(weight_init)
                 step = 0
-                for module, _ in parameters_to_prune:
-                    module.weight = module.weight  
-                    param.data = (param.data * mask[step])
+                for module, _ in parameters_to_prune: 
+                    param.data = (param.data * mask[step]).cuda()
                     step = step + 1
                 step = 0
             else:
@@ -336,11 +339,19 @@ def original_initialization(mask_temp, initial_state_dict):
         if "weight" in name: 
             weight_dev = param.device
             # param.data = torch.from_numpy(mask_temp[step] * initial_state_dict[name].cpu().numpy()).to(weight_dev)
-            param.data = (mask_temp[step] * initial_state_dict[name]).to(weight_dev)
+            param.data = (mask_temp[step] * initial_state_dict[name[:-5]]).to(weight_dev)
             step = step + 1
         if "bias" in name:
             param.data = initial_state_dict[name]
     step = 0
+
+def get_mask(mask, parameters_to_prune):
+    step = 0
+    for module, _ in parameters_to_prune:
+        mask[step] = list(module.named_buffers())[0][1].cuda()
+        step += 1 
+    return mask
+
 
 # Function for Initialization
 def weight_init(m):
