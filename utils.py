@@ -7,16 +7,22 @@ import matplotlib.pyplot as plt
 import copy
 
 #ANCHOR Print table of zeros and non-zeros count
-def print_nonzeros(model):
+def print_nonzeros(model, writer, _ite):
     nonzero = total = 0
+    info_ = ''
     for name, p in model.named_parameters():
         tensor = p.data.cpu().numpy()
         nz_count = np.count_nonzero(tensor)
         total_params = np.prod(tensor.shape)
         nonzero += nz_count
         total += total_params
-        print(f'{name:20} | nonzeros = {nz_count:7} / {total_params:7} ({100 * nz_count / total_params:6.2f}%) | total_pruned = {total_params - nz_count :7} | shape = {tensor.shape}')
-    print(f'alive: {nonzero}, pruned : {total - nonzero}, total: {total}, Compression rate : {total/nonzero:10.2f}x  ({100 * (total-nonzero) / total:6.2f}% pruned)')
+        info = f'{name:20} | nonzeros = {nz_count:7} / {total_params:7} ({100 * nz_count / total_params:6.2f}%) | total_pruned = {total_params - nz_count :7} | shape = {tensor.shape}'
+        print(info)
+        info_ += info
+    writer.add_text("prune info", info_, _ite)
+    summary_info = f'alive: {nonzero}, pruned : {total - nonzero}, total: {total}, Compression rate : {total/nonzero:10.2f}x  ({100 * (total-nonzero) / total:6.2f}% pruned) \n'
+    print(summary_info)
+    writer.add_text("prune summary", summary_info, _ite)
     return (round((nonzero/total)*100,1))
 
 def original_initialization(mask_temp, initial_state_dict):

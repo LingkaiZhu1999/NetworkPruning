@@ -13,7 +13,7 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import matplotlib.pyplot as plt
 import os
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 import torchvision.utils as vutils
 import seaborn as sns
 import torch.nn.init as init
@@ -23,25 +23,26 @@ import pickle
 import utils
 
 # Tensorboard initialization
-writer = SummaryWriter()
+
 
 # Plotting Style
 sns.set_style('darkgrid')
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--lr",default= 1.2e-3, type=float, help="Learning rate")
+parser.add_argument("--lr",default= 0.0003, type=float, help="Learning rate")
 parser.add_argument("--batch_size", default=60, type=int)
-parser.add_argument("--start_iter", default=0, type=int)
-parser.add_argument("--end_iter", default=100, type=int)
+parser.add_argument("--start_prune_round", default=0, type=int)
+parser.add_argument("--train_epochs", default=10000, type=int)
 parser.add_argument("--print_freq", default=1, type=int)
 parser.add_argument("--valid_freq", default=1, type=int)
+parser.add_argument("--early_stop", default=25, type=int)
 parser.add_argument("--resume", action="store_true")
 parser.add_argument("--prune_type", default="lt", type=str, help="lt | reinit")
-parser.add_argument("--gpu", default="0", type=str)
+parser.add_argument("--gpu", default="1", type=str)
 parser.add_argument("--dataset", default="mnist", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
-parser.add_argument("--arch_type", default="vgg16", type=str, help="fc1 | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
+parser.add_argument("--arch_type", default="lenet5", type=str, help="fc1 | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
 parser.add_argument("--prune_percent", default=10, type=int, help="Pruning percent")
-parser.add_argument("--prune_iterations", default=35, type=int, help="Pruning iterations count")
+parser.add_argument("--prune_rounds", default=40, type=int, help="Pruning args.prune_roundss count")
 parser.add_argument("--seed", default=1, type=int)
 
 
@@ -53,6 +54,8 @@ os.environ["CUDA_VISIBLE_DEVICES"]=args.gpu
     
 # Main
 def main(args, ITE=0):
+    
+    writer = SummaryWriter(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     reinit = True if args.prune_type=="reinit" else False
     torch.cuda.manual_seed_all(args.seed)
@@ -123,10 +126,11 @@ def main(args, ITE=0):
     # Weight Initialization
     model.apply(weight_init)
 
+
     # Copying and Saving Initial State
     initial_state_dict = copy.deepcopy(model.state_dict())
     utils.checkdir(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/")
-    torch.save(model, f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/initial_state_dict_{args.prune_type}.pth.tar")
+    torch.save(model, f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/initial_state_dict_{args.prune_type}.pt")
 
     # Making Initial Mask
     make_mask(model)
@@ -140,87 +144,82 @@ def main(args, ITE=0):
         print(name, param.size())
 
     # Pruning
-    # NOTE First Pruning Iteration is of No Compression
+    # NOTE First Pruning args.prune_rounds is of No Compression
     bestacc = 0.0
     best_accuracy = 0
-    ITERATION = args.prune_iterations
-    comp = np.zeros(ITERATION,float)
-    bestacc = np.zeros(ITERATION,float)
+    comp = np.zeros(args.prune_rounds,float)
+    bestacc = np.zeros(args.prune_rounds,float)
     step = 0
-    all_loss = np.zeros(args.end_iter,float)
-    all_accuracy = np.zeros(args.end_iter,float)
+    all_loss = np.zeros(args.train_epochs,float)
+    all_accuracy = np.zeros(args.train_epochs,float)
+    early_stop_trigger = 0
 
 
-    for _ite in range(args.start_iter, ITERATION):
-        if not _ite == 0:
-            prune_by_percentile(args.prune_percent, resample=resample, reinit=reinit)
+    for _ite in range(args.start_prune_round, args.prune_rounds):
+        if not _ite == 0: # don't prune for the first running round, because we want the model to be well trained before we prune it.
+            print(_ite)
+            # prune_percent_each_round = np.power(args.prune_percent, 1/args.prune_rounds) * 0.01 # p^(1/n) %
+            # prune_percent_each_round = args.prune_percent * 0.01 / args.prune_rounds 
+            prune_by_percentile(args.prune_percent * 0.01, resample=resample, reinit=reinit)
             if reinit:
                 model.apply(weight_init)
-                #if args.arch_type == "fc1":
-                #    model = fc1.fc1().to(device)
-                #elif args.arch_type == "lenet5":
-                #    model = LeNet5.LeNet5().to(device)
-                #elif args.arch_type == "alexnet":
-                #    model = AlexNet.AlexNet().to(device)
-                #elif args.arch_type == "vgg16":
-                #    model = vgg.vgg16().to(device)  
-                #elif args.arch_type == "resnet18":
-                #    model = resnet.resnet18().to(device)   
-                #elif args.arch_type == "densenet121":
-                #    model = densenet.densenet121().to(device)   
-                #else:
-                #    print("\nWrong Model choice\n")
-                #    exit()
                 step = 0
                 for name, param in model.named_parameters():
                     if 'weight' in name:
                         weight_dev = param.device
                         param.data = (param.data * mask[step]).to(weight_dev)
-                        # param.data = torch.from_numpy(param.data.cpu().numpy() * mask[step]).to(weight_dev)
                         step = step + 1
                 step = 0
             else:
                 original_initialization(mask, initial_state_dict)
             optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-        print(f"\n--- Pruning Level [{ITE}:{_ite}/{ITERATION}]: ---")
+        print(f"\n--- Pruning Level [{ITE}:{_ite}/{args.prune_rounds}]: ---")
 
         # Print the table of Nonzeros in each layer
-        comp1 = utils.print_nonzeros(model)
+        comp1 = utils.print_nonzeros(model, writer, _ite)
+        print('sparsity', round(100.0 -comp1, 1))
         comp[_ite] = comp1
-        pbar = tqdm(range(args.end_iter))
+        pbar = tqdm(range(args.train_epochs))
 
         for iter_ in pbar:
 
             # Frequency for Testing
             if iter_ % args.valid_freq == 0:
-                accuracy = test(model, val_loader, criterion)
+                val_accuracy = test(model, val_loader, criterion)
 
                 # Save Weights
-                if accuracy > best_accuracy:
-                    best_accuracy = accuracy
+                if val_accuracy > best_accuracy:
+                    best_accuracy = val_accuracy
                     utils.checkdir(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/")
-                    torch.save(model,f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/{_ite}_model_{args.prune_type}.pth.tar")
+                    torch.save(model,f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/{_ite}_model_{args.prune_type}.pt")
+                    early_stop_trigger = 0
+                else:
+                    early_stop_trigger += 1
 
             # Training
             loss = train(model, train_loader, optimizer, criterion)
             all_loss[iter_] = loss
-            all_accuracy[iter_] = accuracy
-            
+            all_accuracy[iter_] = val_accuracy
             # Frequency for Printing Accuracy and Loss
             if iter_ % args.print_freq == 0:
                 pbar.set_description(
-                    f'Train Epoch: {iter_}/{args.end_iter} Loss: {loss:.6f} Accuracy: {accuracy:.2f}% Best Accuracy: {best_accuracy:.2f}%')       
-
+                    f'Train Epoch: {iter_}/{args.train_epochs} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
+            if early_stop_trigger > args.early_stop:
+                break
+        best_val_model = torch.load(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/{_ite}_model_{args.prune_type}.pt")
+        test_accuracy = test(best_val_model, test_loader, criterion)
+        print(f'Test Accuracy: {test_accuracy}')
         writer.add_scalar('Accuracy/val', best_accuracy, comp1)
-        bestacc[_ite]=best_accuracy
+        writer.add_scalar('Accuracy/test', test_accuracy, comp1)
+        bestacc[_ite] = best_accuracy
 
-        # Plotting Loss (Training), Accuracy (Testing), Iteration Curve
-        #NOTE Loss is computed for every iteration while Accuracy is computed only for every {args.valid_freq} iterations. Therefore Accuracy saved is constant during the uncomputed iterations.
+        # Plotting Loss (Training), Accuracy (Testing), args.prune_rounds Curve
+        #NOTE Loss is computed for every args.prune_rounds while Accuracy is computed only for every {args.valid_freq} args.prune_roundss. Therefore Accuracy saved is constant during the uncomputed args.prune_roundss.
         #NOTE Normalized the accuracy to [0,100] for ease of plotting.
-        plt.plot(np.arange(1,(args.end_iter)+1), 100*(all_loss - np.min(all_loss))/np.ptp(all_loss).astype(float), c="blue", label="Loss") 
-        plt.plot(np.arange(1,(args.end_iter)+1), all_accuracy, c="red", label="Accuracy") 
-        plt.title(f"Loss Vs Accuracy Vs Iterations ({args.dataset},{args.arch_type})") 
-        plt.xlabel("Iterations") 
+        plt.plot(np.arange(1,(args.train_epochs)+1), 100*(all_loss - np.min(all_loss))/np.ptp(all_loss).astype(float), c="blue", label="Loss") 
+        plt.plot(np.arange(1,(args.train_epochs)+1), all_accuracy, c="red", label="Accuracy") 
+        plt.title(f"Loss Vs Accuracy Vs args.prune_roundss ({args.dataset},{args.arch_type})") 
+        plt.xlabel("args.prune_roundss") 
         plt.ylabel("Loss and Accuracy") 
         plt.legend() 
         plt.grid(color="gray") 
@@ -240,8 +239,8 @@ def main(args, ITE=0):
         
         # Making variables into 0
         best_accuracy = 0
-        all_loss = np.zeros(args.end_iter,float)
-        all_accuracy = np.zeros(args.end_iter,float)
+        all_loss = np.zeros(args.train_epochs,float)
+        all_accuracy = np.zeros(args.train_epochs,float)
 
     # Dumping Values for Plotting
     utils.checkdir(f"{os.getcwd()}/dumps/lt/{args.arch_type}/{args.dataset}/")
@@ -249,7 +248,7 @@ def main(args, ITE=0):
     bestacc.dump(f"{os.getcwd()}/dumps/lt/{args.arch_type}/{args.dataset}/{args.prune_type}_bestaccuracy.dat")
 
     # Plotting
-    a = np.arange(args.prune_iterations)
+    a = np.arange(args.prune_rounds)
     plt.plot(a, bestacc, c="blue", label="Winning tickets") 
     plt.title(f"Test Accuracy vs Unpruned Weights Percentage ({args.dataset},{args.arch_type})") 
     plt.xlabel("Unpruned Weights Percentage") 
@@ -278,15 +277,9 @@ def train(model, train_loader, optimizer, criterion):
         # Freezing Pruned weights by making their gradients Zero
         for name, p in model.named_parameters():
             if 'weight' in name:
-
-                # tensor = p.data.cpu().numpy()
-                # grad_tensor = p.grad.data.cpu().numpy()
-                # grad_tensor = np.where(tensor < EPS, 0, grad_tensor)
-                # p.grad.data = torch.from_numpy(grad_tensor).to(device)
-
                 tensor = p.data
                 grad_tensor = p.grad.data
-                grad_tensor = torch.where(tensor < EPS, 0, grad_tensor)
+                grad_tensor = torch.where(torch.abs(tensor) < EPS, 0, grad_tensor)
                 p.grad.data = grad_tensor.to(device)
 
         optimizer.step()
@@ -321,28 +314,26 @@ def prune_by_percentile(percent, resample=False, reinit=False,**kwargs):
 
             # We do not prune bias term
             if 'weight' in name:
-                # tensor = param.data.cpu().numpy()
-                # alive = tensor[np.nonzero(tensor)] # flattened array of nonzero values
-                # percentile_value = np.percentile(abs(alive), percent)
+                if 'output' not in name:
+                    tensor = param.data
+                    alive = tensor[torch.nonzero(tensor, as_tuple=True)]
+                    percentile_value = torch.quantile(abs(alive), percent)
+                    weight_dev = param.device
+                    new_mask = torch.where(torch.abs(tensor) < percentile_value, 0, mask[step])
+                    param.data = (tensor * new_mask).to(weight_dev)
 
-                # # Convert Tensors to numpy and calculate
-                # weight_dev = param.device
-                # new_mask = np.where(abs(tensor) < percentile_value, 0, mask[step])
-                
-                # # Apply new weight and mask
-                # param.data = torch.from_numpy(tensor * new_mask).to(weight_dev)
+                    mask[step] = new_mask
+                    step += 1
+                else:
+                    tensor = param.data
+                    alive = tensor[torch.nonzero(tensor, as_tuple=True)]
+                    percentile_value = torch.quantile(abs(alive), percent / 2)
+                    weight_dev = param.device
+                    new_mask = torch.where(torch.abs(tensor) < percentile_value, 0, mask[step])
+                    param.data = (tensor * new_mask).to(weight_dev)
 
-
-
-                tensor = param.data
-                alive = tensor[torch.nonzero(tensor, as_tuple=True)]
-                percentile_value = torch.quantile(abs(alive), percent)
-                weight_dev = param.device
-                new_mask = torch.where(torch.abs(tensor) < percentile_value, 0, mask[step])
-                param.data = (tensor * new_mask).to(weight_dev)
-
-                mask[step] = new_mask
-                step += 1
+                    mask[step] = new_mask
+                    step += 1
         step = 0
 
 # Function to make an empty mask of the same size as the model
@@ -372,7 +363,6 @@ def original_initialization(mask_temp, initial_state_dict):
         if "weight" in name: 
             weight_dev = param.device
             # param.data = torch.from_numpy(mask_temp[step] * initial_state_dict[name].cpu().numpy()).to(weight_dev)
-
             param.data = (mask_temp[step] * initial_state_dict[name]).to(weight_dev)
             step = step + 1
         if "bias" in name:

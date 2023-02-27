@@ -15,12 +15,14 @@ class LeNet5(nn.Module):
             nn.Linear(64*14*14, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, num_classes),
+            nn.ReLU(inplace=True)
+            # nn.Linear(256, num_classes),
         )
+        self.output = nn.Linear(256, num_classes)
 
     def forward(self, x):
         x = self.features(x)
         x = torch.flatten(x, 1)
         x = self.classifier(x)
+        x = self.output(x)
         return x
