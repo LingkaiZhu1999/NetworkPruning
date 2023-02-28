@@ -32,16 +32,16 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--lr",default= 0.0003, type=float, help="Learning rate")
 parser.add_argument("--batch_size", default=60, type=int)
 parser.add_argument("--start_prune_round", default=0, type=int)
-parser.add_argument("--train_epochs", default=10000, type=int)
+parser.add_argument("--train_epochs", default=1000, type=int)
 parser.add_argument("--print_freq", default=1, type=int)
 parser.add_argument("--valid_freq", default=1, type=int)
 parser.add_argument("--early_stop", default=25, type=int)
 parser.add_argument("--resume", action="store_true")
-parser.add_argument("--prune_type", default="lt", type=str, help="lt | reinit")
-parser.add_argument("--gpu", default="1", type=str)
+parser.add_argument("--prune_type", default="original", type=str, help="original | reinit")
+parser.add_argument("--gpu", default="0", type=str)
 parser.add_argument("--dataset", default="mnist", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
 parser.add_argument("--arch_type", default="lenet5", type=str, help="fc1 | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
-parser.add_argument("--prune_percent", default=10, type=int, help="Pruning percent")
+parser.add_argument("--prune_percent", default=15, type=int, help="Pruning percent")
 parser.add_argument("--prune_rounds", default=40, type=int, help="Pruning args.prune_roundss count")
 parser.add_argument("--seed", default=1, type=int)
 
@@ -149,6 +149,8 @@ def main(args, ITE=0):
     best_accuracy = 0
     comp = np.zeros(args.prune_rounds,float)
     bestacc = np.zeros(args.prune_rounds,float)
+    testacc = np.zeros(args.prune_rounds, float)
+    sparsity_ = np.zeros(args.prune_rounds, float)
     step = 0
     all_loss = np.zeros(args.train_epochs,float)
     all_accuracy = np.zeros(args.train_epochs,float)
@@ -177,7 +179,8 @@ def main(args, ITE=0):
 
         # Print the table of Nonzeros in each layer
         comp1 = utils.print_nonzeros(model, writer, _ite)
-        print('sparsity', round(100.0 -comp1, 1))
+        sparsity = round(100.0 -comp1, 1)
+        sparsity_[_ite] = sparsity
         comp[_ite] = comp1
         pbar = tqdm(range(args.train_epochs))
 
@@ -212,7 +215,13 @@ def main(args, ITE=0):
         writer.add_scalar('Accuracy/val', best_accuracy, comp1)
         writer.add_scalar('Accuracy/test', test_accuracy, comp1)
         bestacc[_ite] = best_accuracy
-
+        testacc[_ite] = test_accuracy
+        plt.plot(sparsity_[:_ite+1], testacc[:_ite+1])
+        plt.xlabel('Sparsity')
+        plt.ylabel('Test accuracy')
+        utils.checkdir(f"{os.getcwd()}/plots/lt/{args.arch_type}/{args.dataset}/")
+        plt.savefig(f"{os.getcwd()}/plots/lt/{args.arch_type}/{args.dataset}/{args.prune_type}_.png", dpi=1200)
+        plt.close()
         # Plotting Loss (Training), Accuracy (Testing), args.prune_rounds Curve
         #NOTE Loss is computed for every args.prune_rounds while Accuracy is computed only for every {args.valid_freq} args.prune_roundss. Therefore Accuracy saved is constant during the uncomputed args.prune_roundss.
         #NOTE Normalized the accuracy to [0,100] for ease of plotting.
