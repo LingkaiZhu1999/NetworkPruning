@@ -10,9 +10,9 @@ import copy
 def print_nonzeros(model, writer, _ite):
     nonzero = total = 0
     info_ = ''
-    for name, p in model.named_parameters():
-        tensor = p.data.cpu().numpy()
-        nz_count = np.count_nonzero(tensor)
+    for name, p in model.named_buffers():
+        tensor = p.data
+        nz_count = torch.count_nonzero(tensor).cpu().numpy()
         total_params = np.prod(tensor.shape)
         nonzero += nz_count
         total += total_params
@@ -32,7 +32,7 @@ def original_initialization(mask_temp, initial_state_dict):
     for name, param in model.named_parameters(): 
         if "weight" in name: 
             weight_dev = param.device
-            param.data = torch.from_numpy(mask_temp[step] * initial_state_dict[name].cpu().numpy()).to(weight_dev)
+            param.data = (mask_temp[step] * initial_state_dict[name]).to(weight_dev)
             step = step + 1
         if "bias" in name:
             param.data = initial_state_dict[name]
