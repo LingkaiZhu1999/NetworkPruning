@@ -18,7 +18,7 @@ import torchvision.utils as vutils
 import seaborn as sns
 import torch.nn.init as init
 import pickle
-
+import torch.nn.utils.prune as prune
 # Custom Libraries
 import utils
 
@@ -32,7 +32,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--lr",default= 0.0003, type=float, help="Learning rate")
 parser.add_argument("--batch_size", default=60, type=int)
 parser.add_argument("--start_prune_round", default=0, type=int)
-parser.add_argument("--train_epochs", default=1000, type=int)
+parser.add_argument("--train_epochs", default=1, type=int)
 parser.add_argument("--print_freq", default=1, type=int)
 parser.add_argument("--valid_freq", default=1, type=int)
 parser.add_argument("--early_stop", default=25, type=int)
@@ -122,7 +122,11 @@ def main(args, ITE=0):
     else:
         print("\nWrong Model choice\n")
         exit()
-
+    step = 0
+    for name, param in model.named_parameters(): 
+        if 'weight' in name:
+            step = step + 1
+    mask = [None]* step 
     # Weight Initialization
     model.apply(weight_init)
 
@@ -131,9 +135,6 @@ def main(args, ITE=0):
     initial_state_dict = copy.deepcopy(model.state_dict())
     utils.checkdir(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/")
     torch.save(model, f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/initial_state_dict_{args.prune_type}.pt")
-
-    # Making Initial Mask
-    make_mask(model)
 
     # Optimizer and Loss
     optimizer = torch.optim.Adam(model.parameters(), weight_decay=1e-4)
@@ -163,6 +164,7 @@ def main(args, ITE=0):
             # prune_percent_each_round = np.power(args.prune_percent, 1/args.prune_rounds) * 0.01 # p^(1/n) %
             # prune_percent_each_round = args.prune_percent * 0.01 / args.prune_rounds 
             prune_by_percentile(args.prune_percent * 0.01, resample=resample, reinit=reinit)
+            mask = get_mask(model)
             if reinit:
                 model.apply(weight_init)
                 step = 0
@@ -212,8 +214,8 @@ def main(args, ITE=0):
         best_val_model = torch.load(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/{_ite}_model_{args.prune_type}.pt")
         test_accuracy = test(best_val_model, test_loader, criterion)
         print(f'Test Accuracy: {test_accuracy}')
-        writer.add_scalar('Accuracy/val', best_accuracy, comp1)
-        writer.add_scalar('Accuracy/test', test_accuracy, comp1)
+        writer.add_scalar('Accuracy/val', best_accuracy, sparsity)
+        writer.add_scalar('Accuracy/test', test_accuracy, sparsity)
         bestacc[_ite] = best_accuracy
         testacc[_ite] = test_accuracy
         plt.plot(sparsity_[:_ite+1], testacc[:_ite+1])
@@ -316,53 +318,14 @@ def prune_by_percentile(percent, resample=False, reinit=False,**kwargs):
         global step
         global mask
         global model
-
+        
         # Calculate percentile value
-        step = 0
-        for name, param in model.named_parameters():
+        for name, module in model.named_parameters():
+            if isinstance(module, torch.nn.Conv2d):
+                prune.l1_unstructured(module, name='weight', amount=args.prune_percent * 0.01)
 
-            # We do not prune bias term
-            if 'weight' in name:
-                if 'output' not in name:
-                    tensor = param.data
-                    alive = tensor[torch.nonzero(tensor, as_tuple=True)]
-                    percentile_value = torch.quantile(abs(alive), percent)
-                    weight_dev = param.device
-                    new_mask = torch.where(torch.abs(tensor) < percentile_value, 0, mask[step])
-                    param.data = (tensor * new_mask).to(weight_dev)
-
-                    mask[step] = new_mask
-                    step += 1
-                else:
-                    tensor = param.data
-                    alive = tensor[torch.nonzero(tensor, as_tuple=True)]
-                    percentile_value = torch.quantile(abs(alive), percent / 2)
-                    weight_dev = param.device
-                    new_mask = torch.where(torch.abs(tensor) < percentile_value, 0, mask[step])
-                    param.data = (tensor * new_mask).to(weight_dev)
-
-                    mask[step] = new_mask
-                    step += 1
-        step = 0
-
-# Function to make an empty mask of the same size as the model
-def make_mask(model):
-    global step
-    global mask
-    step = 0
-    for name, param in model.named_parameters(): 
-        if 'weight' in name:
-            step = step + 1
-    mask = [None]* step 
-    step = 0
-    for name, param in model.named_parameters(): 
-        if 'weight' in name:
-            # tensor = param.data.cpu().numpy()
-            # mask[step] = np.ones_like(tensor)
-            tensor = param.data
-            mask[step] = torch.ones_like(tensor)
-            step = step + 1
-    step = 0
+            elif isinstance(module, torch.nn.Linear):
+                prune.l1_unstructured(module, name='weight', amount=args.prune_percent * 0.01)
 
 def original_initialization(mask_temp, initial_state_dict):
     global model
@@ -445,6 +408,13 @@ def weight_init(m):
                 init.orthogonal_(param.data)
             else:
                 init.normal_(param.data)
+
+def get_mask(mask, model):
+    step = 0
+    for name, module in model.named_parameters():
+        mask[step] = list(module.named_buffers())[0][1].cuda()
+        step += 1 
+    return mask
 
 
 if __name__=="__main__":
