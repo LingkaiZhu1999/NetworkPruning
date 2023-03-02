@@ -42,7 +42,17 @@ def original_initialization(mask_temp, initial_state_dict):
             param.data = initial_state_dict[name]
     step = 0
 
-        
+def plot_sparsity_testacc(sparsity, testacc, args):
+    plt.plot(sparsity, testacc)
+    plt.xlabel('Sparsity')
+    plt.xticks(sparsity)
+    # plt.set_
+    plt.ylabel('Test accuracy')
+    plt.ylim([70,100])
+    checkdir(f"{os.getcwd()}/plots/lt/{args.arch_type}/{args.dataset}/")
+    plt.savefig(f"{os.getcwd()}/plots/lt/{args.arch_type}/{args.dataset}/{args.prune_type}_{args.prune_percent}_{args.prune_rounds}_.png", dpi=1200)
+    plt.close()
+
 
 
 #ANCHOR Checks of the directory exist and if not, creates a new directory
