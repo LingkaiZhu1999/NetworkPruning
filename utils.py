@@ -10,7 +10,11 @@ import copy
 def print_nonzeros(model, writer, _ite):
     nonzero = total = 0
     info_ = ''
-    for name, p in model.named_buffers():
+    if list(model.named_buffers()) != []:
+        model_info = model.named_buffers()
+    else:
+        model_info = model.named_parameters()   
+    for name, p in model_info:
         tensor = p.data
         nz_count = torch.count_nonzero(tensor).cpu().numpy()
         total_params = np.prod(tensor.shape)
