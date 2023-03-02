@@ -29,20 +29,21 @@ import utils
 sns.set_style('darkgrid')
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--lr",default= 0.0003, type=float, help="Learning rate")
+parser.add_argument("--lr",default=0.0002, type=float, help="Learning rate") # learning rate have a big effect
 parser.add_argument("--batch_size", default=60, type=int)
 parser.add_argument("--start_prune_round", default=0, type=int)
-parser.add_argument("--train_epochs", default=1, type=int)
+parser.add_argument("--train_epochs", default=2, type=int)
 parser.add_argument("--print_freq", default=1, type=int)
 parser.add_argument("--valid_freq", default=1, type=int)
-parser.add_argument("--early_stop", default=25, type=int)
+parser.add_argument("--early_stop", default=15, type=int)
 parser.add_argument("--resume", action="store_true")
 parser.add_argument("--prune_type", default="original", type=str, help="original | reinit")
-parser.add_argument("--gpu", default="0", type=str)
+parser.add_argument("--gpu", default="1", type=str)
 parser.add_argument("--dataset", default="mnist", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
-parser.add_argument("--arch_type", default="lenet5", type=str, help="fc1 | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
-parser.add_argument("--prune_percent", default=15, type=int, help="Pruning percent")
-parser.add_argument("--prune_rounds", default=40, type=int, help="Pruning args.prune_roundss count")
+parser.add_argument("--arch_type", default="fc1", type=str, help="fc1 | advanced_dropout_fc | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
+parser.add_argument("--prune_percent", default=20, type=int, help="Pruning percent")
+parser.add_argument("--prune_rounds", default=50, type=int, help="Pruning args.prune_roundss count")
+parser.add_argument("--weight_decay", default=1.2e-3, type=float, help="weight decay for adam optim")
 parser.add_argument("--seed", default=1, type=int)
 
 
@@ -75,7 +76,7 @@ def main(args, ITE=0):
     if args.dataset == "mnist":
         traindataset = datasets.MNIST('../data', train=True, download=True,transform=transform)
         testdataset = datasets.MNIST('../data', train=False, transform=transform)
-        from archs.mnist import AlexNet, LeNet5, fc1, vgg, resnet
+        from archs.mnist import AlexNet, advanced_dropout_fc, LeNet5, fc1, vgg, resnet
 
     elif args.dataset == "cifar10":
         traindataset = datasets.CIFAR10('../data', train=True, download=True,transform=transform)
@@ -107,7 +108,9 @@ def main(args, ITE=0):
     # Importing Network Architecture
     global model
     if args.arch_type == "fc1":
-       model = fc1.fc1().to(device)
+        model = fc1.fc1().to(device)
+    elif args.arch_type == "advanced_dropout_fc":
+        model = advanced_dropout_fc.advanced_drop_fc().to(device)
     elif args.arch_type == "lenet5":
         model = LeNet5.LeNet5().to(device)
     elif args.arch_type == "alexnet":
@@ -137,7 +140,7 @@ def main(args, ITE=0):
     torch.save(model, f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/initial_state_dict_{args.prune_type}.pt")
 
     # Optimizer and Loss
-    optimizer = torch.optim.Adam(model.parameters(), weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss() # Default was F.nll_loss
 
     # Layer Looper
@@ -164,7 +167,7 @@ def main(args, ITE=0):
             # prune_percent_each_round = np.power(args.prune_percent, 1/args.prune_rounds) * 0.01 # p^(1/n) %
             # prune_percent_each_round = args.prune_percent * 0.01 / args.prune_rounds 
             prune_by_percentile(args.prune_percent * 0.01, resample=resample, reinit=reinit)
-            mask = get_mask(model)
+            mask = get_mask(mask, model)
             if reinit:
                 model.apply(weight_init)
                 step = 0
@@ -176,7 +179,7 @@ def main(args, ITE=0):
                 step = 0
             else:
                 original_initialization(mask, initial_state_dict)
-            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         print(f"\n--- Pruning Level [{ITE}:{_ite}/{args.prune_rounds}]: ---")
 
         # Print the table of Nonzeros in each layer
@@ -218,12 +221,7 @@ def main(args, ITE=0):
         writer.add_scalar('Accuracy/test', test_accuracy, sparsity)
         bestacc[_ite] = best_accuracy
         testacc[_ite] = test_accuracy
-        plt.plot(sparsity_[:_ite+1], testacc[:_ite+1])
-        plt.xlabel('Sparsity')
-        plt.ylabel('Test accuracy')
-        utils.checkdir(f"{os.getcwd()}/plots/lt/{args.arch_type}/{args.dataset}/")
-        plt.savefig(f"{os.getcwd()}/plots/lt/{args.arch_type}/{args.dataset}/{args.prune_type}_.png", dpi=1200)
-        plt.close()
+        utils.plot_sparsity_testacc(sparsity_[:_ite+1], testacc[:_ite+1], args)
         # Plotting Loss (Training), Accuracy (Testing), args.prune_rounds Curve
         #NOTE Loss is computed for every args.prune_rounds while Accuracy is computed only for every {args.valid_freq} args.prune_roundss. Therefore Accuracy saved is constant during the uncomputed args.prune_roundss.
         #NOTE Normalized the accuracy to [0,100] for ease of plotting.
@@ -286,12 +284,12 @@ def train(model, train_loader, optimizer, criterion):
         train_loss.backward()
 
         # Freezing Pruned weights by making their gradients Zero
-        for name, p in model.named_parameters():
-            if 'weight' in name:
-                tensor = p.data
-                grad_tensor = p.grad.data
-                grad_tensor = torch.where(torch.abs(tensor) < EPS, 0, grad_tensor)
-                p.grad.data = grad_tensor.to(device)
+        # for name, p in model.named_parameters():
+        #     if 'weight' in name:
+        #         tensor = p.data
+        #         grad_tensor = p.grad.data
+        #         grad_tensor = torch.where(torch.abs(tensor) < EPS, 0, grad_tensor)
+        #         p.grad.data = grad_tensor.to(device)
 
         optimizer.step()
     return train_loss.item()
@@ -320,12 +318,15 @@ def prune_by_percentile(percent, resample=False, reinit=False,**kwargs):
         global model
         
         # Calculate percentile value
-        for name, module in model.named_parameters():
-            if isinstance(module, torch.nn.Conv2d):
-                prune.l1_unstructured(module, name='weight', amount=args.prune_percent * 0.01)
+        prune.l1_unstructured(model.fc1, name='weight', amount=args.prune_percent * 0.01)
+        prune.l1_unstructured(model.fc2, name='weight', amount=args.prune_percent * 0.01)
+        prune.l1_unstructured(model.fc3, name='weight', amount=args.prune_percent * 0.01 / 2)
+        # for module in model.modules():
+        #     if isinstance(module, torch.nn.Conv2d):
+        #         prune.l1_unstructured(module, name='weight', amount=args.prune_percent * 0.01)
 
-            elif isinstance(module, torch.nn.Linear):
-                prune.l1_unstructured(module, name='weight', amount=args.prune_percent * 0.01)
+        #     elif isinstance(module, torch.nn.Linear) and module:
+        #         prune.l1_unstructured(module, name='weight', amount=args.prune_percent * 0.01 / 2)
 
 def original_initialization(mask_temp, initial_state_dict):
     global model
@@ -335,7 +336,7 @@ def original_initialization(mask_temp, initial_state_dict):
         if "weight" in name: 
             weight_dev = param.device
             # param.data = torch.from_numpy(mask_temp[step] * initial_state_dict[name].cpu().numpy()).to(weight_dev)
-            param.data = (mask_temp[step] * initial_state_dict[name]).to(weight_dev)
+            param.data = (mask_temp[step] * initial_state_dict[name[:-5]]).to(weight_dev)
             step = step + 1
         if "bias" in name:
             param.data = initial_state_dict[name]
@@ -411,7 +412,7 @@ def weight_init(m):
 
 def get_mask(mask, model):
     step = 0
-    for name, module in model.named_parameters():
+    for module in model.children():
         mask[step] = list(module.named_buffers())[0][1].cuda()
         step += 1 
     return mask
