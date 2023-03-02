@@ -21,7 +21,7 @@ import pickle
 import torch.nn.utils.prune as prune
 # Custom Libraries
 import utils
-
+import PIL
 # Tensorboard initialization
 
 
@@ -31,7 +31,7 @@ sns.set_style('darkgrid')
 parser = argparse.ArgumentParser()
 parser.add_argument("--lr",default=0.0002, type=float, help="Learning rate") # learning rate have a big effect
 parser.add_argument("--batch_size", default=60, type=int)
-parser.add_argument("--start_prune_round", default=0, type=int)
+parser.add_argument("--start_prune_prune_round", default=0, type=int)
 parser.add_argument("--train_epochs", default=2, type=int)
 parser.add_argument("--print_freq", default=1, type=int)
 parser.add_argument("--valid_freq", default=1, type=int)
@@ -52,7 +52,10 @@ args = parser.parse_args()
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   
 os.environ["CUDA_VISIBLE_DEVICES"]=args.gpu
-    
+utils.checkdir(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/")
+with open(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/args.txt", 'w') as f:
+    for arg in vars(args):
+        print('%s: %s' %(arg, getattr(args, arg)), file=f) 
 # Main
 def main(args, ITE=0):
     
@@ -136,9 +139,7 @@ def main(args, ITE=0):
 
     # Copying and Saving Initial State
     initial_state_dict = copy.deepcopy(model.state_dict())
-    utils.checkdir(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/")
     torch.save(model, f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/initial_state_dict_{args.prune_type}.pt")
-
     # Optimizer and Loss
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss() # Default was F.nll_loss
@@ -161,11 +162,11 @@ def main(args, ITE=0):
     early_stop_trigger = 0
 
 
-    for _ite in range(args.start_prune_round, args.prune_rounds):
-        if not _ite == 0: # don't prune for the first running round, because we want the model to be well trained before we prune it.
-            print(_ite)
-            # prune_percent_each_round = np.power(args.prune_percent, 1/args.prune_rounds) * 0.01 # p^(1/n) %
-            # prune_percent_each_round = args.prune_percent * 0.01 / args.prune_rounds 
+    for prune_round in range(args.start_prune_prune_round, args.prune_rounds):
+        if not prune_round == 0: # don't prune for the first running prune_round, because we want the model to be well trained before we prune it.
+            print(prune_round)
+            # prune_percent_each_prune_round = np.power(args.prune_percent, 1/args.prune_rounds) * 0.01 # p^(1/n) %
+            # prune_percent_each_prune_round = args.prune_percent * 0.01 / args.prune_rounds 
             prune_by_percentile(args.prune_percent * 0.01, resample=resample, reinit=reinit)
             mask = get_mask(mask, model)
             if reinit:
@@ -180,13 +181,13 @@ def main(args, ITE=0):
             else:
                 original_initialization(mask, initial_state_dict)
             optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        print(f"\n--- Pruning Level [{ITE}:{_ite}/{args.prune_rounds}]: ---")
+        print(f"\n--- Pruning Level [{ITE}:{prune_round}/{args.prune_rounds}]: ---")
 
         # Print the table of Nonzeros in each layer
-        comp1 = utils.print_nonzeros(model, writer, _ite)
-        sparsity = round(100.0 -comp1, 1)
-        sparsity_[_ite] = sparsity
-        comp[_ite] = comp1
+        comp1 = utils.print_nonzeros(model, writer, prune_round)
+        sparsity = round(float(100.0 - comp1), 1)
+        sparsity_[prune_round] = sparsity
+        comp[prune_round] = comp1
         pbar = tqdm(range(args.train_epochs))
 
         for iter_ in pbar:
@@ -194,12 +195,12 @@ def main(args, ITE=0):
             # Frequency for Testing
             if iter_ % args.valid_freq == 0:
                 val_accuracy = test(model, val_loader, criterion)
-
+                writer.add_scalar(f'{prune_round}/valacc', val_accuracy, iter_)
                 # Save Weights
                 if val_accuracy > best_accuracy:
                     best_accuracy = val_accuracy
                     utils.checkdir(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/")
-                    torch.save(model,f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/{_ite}_model_{args.prune_type}.pt")
+                    torch.save(model,f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/{prune_round}_model_{args.prune_type}.pt")
                     early_stop_trigger = 0
                 else:
                     early_stop_trigger += 1
@@ -214,14 +215,15 @@ def main(args, ITE=0):
                     f'Train Epoch: {iter_}/{args.train_epochs} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
             if early_stop_trigger > args.early_stop:
                 break
-        best_val_model = torch.load(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/{_ite}_model_{args.prune_type}.pt")
+        best_val_model = torch.load(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/{prune_round}_model_{args.prune_type}.pt")
         test_accuracy = test(best_val_model, test_loader, criterion)
         print(f'Test Accuracy: {test_accuracy}')
         writer.add_scalar('Accuracy/val', best_accuracy, sparsity)
         writer.add_scalar('Accuracy/test', test_accuracy, sparsity)
-        bestacc[_ite] = best_accuracy
-        testacc[_ite] = test_accuracy
-        utils.plot_sparsity_testacc(sparsity_[:_ite+1], testacc[:_ite+1], args)
+        bestacc[prune_round] = best_accuracy
+        testacc[prune_round] = test_accuracy
+        fig = utils.plot_sparsity_testacc(sparsity_[:prune_round+1], testacc[:prune_round+1], args)
+        writer.add_figure('sparsity_testacc', fig, prune_round)
         # Plotting Loss (Training), Accuracy (Testing), args.prune_rounds Curve
         #NOTE Loss is computed for every args.prune_rounds while Accuracy is computed only for every {args.valid_freq} args.prune_roundss. Therefore Accuracy saved is constant during the uncomputed args.prune_roundss.
         #NOTE Normalized the accuracy to [0,100] for ease of plotting.
