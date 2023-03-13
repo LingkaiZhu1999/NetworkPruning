@@ -27,23 +27,25 @@ import random
 sns.set_style('darkgrid')
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--lr",default= 0.01, type=float, help="Learning rate")
+parser.add_argument("--method", default="proposed", help="the proposed method")
+parser.add_argument("--lr", default=0.01, type=float, help="Learning rate")
 parser.add_argument("--batch_size", default=60, type=int)
 parser.add_argument("--start_prune_round", default=0, type=int)
 parser.add_argument("--train_epochs", default=200, type=int)
 parser.add_argument("--print_freq", default=1, type=int)
 parser.add_argument("--valid_freq", default=1, type=int)
-parser.add_argument("--early_stop", default=25, type=int)
+parser.add_argument("--early_stop", default=50, type=int)
 parser.add_argument("--resume", action="store_true")
 parser.add_argument("--prune_type", default="local", type=str, help="local | global")
-parser.add_argument("--gpu", default="0", type=str)
+parser.add_argument("--gpu", default="1", type=str)
 parser.add_argument("--dataset", default="mnist", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
-parser.add_argument("--arch_type", default="advanced_dropout_fc", type=str, help="fc1 | advanced_dropout_fc| lenet5 | alexnet | vgg16 | resnet18 | densenet121")
-parser.add_argument("--initial_percent", default=1.9, type=float, help='percentage of the weights that is trainable and initialized')
-parser.add_argument("--prune_percent", default=15, type=int, help="Pruning percent")
+parser.add_argument("--arch_type", default="fc1", type=str, help="fc1 | advanced_dropout_fc| lenet5 | alexnet | vgg16 | resnet18 | densenet121")
+parser.add_argument("--initial_percent", default=100, type=float, help='percentage of the weights that is trainable and initialized')
 parser.add_argument("--prune_rounds", default=1, type=int, help="Pruning args.prune_roundss count")
-parser.add_argument("--prune_ratio", default=0.01, type=float, help="Prune ratio during train")
-parser.add_argument("--prune_prob", default=0.00, type=float, help="probability to prune during train")
+parser.add_argument("--prune_ratio", default=1, type=float, help="Prune ratio during train")
+parser.add_argument("--prune_prob", default=0.01, type=float, help="probability to prune during train")
+parser.add_argument("--optimizer", default="sgd", help="adam | sgd")
+parser.add_argument("--weight_decay", default=1.2e-3, type=float, help="weight decay for adam optim")
 parser.add_argument("--seed", default=1, type=int)
 
 
@@ -52,10 +54,13 @@ args = parser.parse_args()
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   
 os.environ["CUDA_VISIBLE_DEVICES"]=args.gpu
-
+utils.checkdir(f"{os.getcwd()}/saves/{args.method}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/")
+with open(f"{os.getcwd()}/saves/{args.method}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/args.txt", 'w') as f:
+    for arg in vars(args):
+        print('%s: %s' %(arg, getattr(args, arg)), file=f) 
 def main(args, ITE=0):
     
-    writer = SummaryWriter(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/")
+    writer = SummaryWriter(f"{os.getcwd()}/saves/{args.method}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     reinit = True if args.prune_type=="reinit" else False
     torch.cuda.manual_seed_all(args.seed)
@@ -125,23 +130,17 @@ def main(args, ITE=0):
         print("\nWrong Model choice\n")
         exit()
     step = 1
-    # for name, param in model.named_parameters(): 
-    #     if 'weight' in name:
-    #         step = step + 1
-    mask = [None] * 3 
+    for name, param in model.named_parameters(): 
+        if 'weight' in name:
+            step = step + 1
+    mask = [None] * step
     # Weight Initialization
     model.apply(weight_init)
     # initialize a small sub-network with args.initial_percent weight
-    # for module in model.children():
-    #     print(module)
-    #     if isinstance(module, torch.nn.Conv2d):
-    #         prune.random_unstructured(module, name='weight', amount=1.0 - args.initial_percent * 0.01)
-    #     elif isinstance(module, torch.nn.Linear):
-    #         prune.random_unstructured(module, name='weight', amount=1.0 - args.initial_percent * 0.01)
     if args.prune_type == 'local':
-        prune.random_unstructured(model.fc1, name='weight', amount=1.0 - args.initial_percent * 0.01)
-        prune.random_unstructured(model.fc2, name='weight', amount=1.0 - args.initial_percent * 0.01)
-        prune.random_unstructured(model.fc3, name='weight', amount=0.)
+        prune.random_unstructured(model.fc1, name='weight', amount=1.0 - args.initial_percent*0.01)
+        prune.random_unstructured(model.fc2, name='weight', amount=1.0 - args.initial_percent*0.01)
+        prune.random_unstructured(model.fc3, name='weight', amount=1.0 - args.initial_percent*0.01)
     elif args.prune_type == 'global':
         parameters_to_prune = (
             (model.fc1, 'weight'),
@@ -153,16 +152,21 @@ def main(args, ITE=0):
         raise Exception('Invalid prune type.')
 
     # mask = get_mask(mask, model)
-    mask[0] = list(model.fc1.named_buffers())[0][1].cuda()
-    mask[1] = list(model.fc2.named_buffers())[0][1].cuda()
-    mask[2] = list(model.fc3.named_buffers())[0][1].cuda()
+    # mask[0] = list(model.fc1.named_buffers())[0][1].cuda()
+    # mask[1] = list(model.fc2.named_buffers())[0][1].cuda()
+    # mask[2] = list(model.fc3.named_buffers())[0][1].cuda()
     # Copying and Saving Initial State
-    initial_state_dict = copy.deepcopy(model.state_dict())
-    utils.checkdir(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/")
-    torch.save(model, f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/initial_state_dict_{args.prune_type}.pt")
+    utils.checkdir(f"{os.getcwd()}/saves/{args.method}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/")
+    torch.save(model, f"{os.getcwd()}/saves/{args.method}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/initial_state_dict_{args.prune_type}.pt")
 
     # Optimizer and Loss
-    optimizer = torch.optim.Adam(model.parameters(), weight_decay=1e-4)
+    if args.optimizer == 'adam':
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    elif args.optimizer == 'sgd':
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+    else:
+        raise Exception('wrong optimizer, has to be adam or sgd')
+
     criterion = nn.CrossEntropyLoss() # Default was F.nll_loss
 
     # Layer Looper
@@ -186,73 +190,69 @@ def main(args, ITE=0):
     for _ite in range(args.start_prune_round, args.prune_rounds):
         if not _ite == 0: # don't prune for the first running round, because we want the model to be well trained before we prune it.
             print(_ite)
-            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+            # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         print(f"\n--- Pruning Level [{ITE}:{_ite}/{args.prune_rounds}]: ---")
 
         # Print the table of Nonzeros in each layer
         comp1 = utils.print_nonzeros(model, writer, _ite)
-        sparsity = round(100.0 -comp1, 1)
+        sparsity = round(100.0-comp1, 1)
         sparsity_[_ite] = sparsity
         comp[_ite] = comp1
         pbar = tqdm(range(args.train_epochs))
 
-        for iter_ in pbar:
+        for train_iter in pbar:
             # Frequency for Testing
-            if iter_ % args.valid_freq == 0:
+            if train_iter % args.valid_freq == 0:
                 val_accuracy = test(model, val_loader, criterion)
 
                 # Save Weights
                 if val_accuracy > best_accuracy:
                     best_accuracy = val_accuracy
-                    utils.checkdir(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/")
-                    torch.save(model,f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/{_ite}_model_{args.prune_type}.pt")
+                    utils.checkdir(f"{os.getcwd()}/saves/{args.method}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/")
+                    torch.save(model,f"{os.getcwd()}/saves/{args.method}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/{_ite}_model_{args.prune_type}.pt")
                     early_stop_trigger = 0
                 else:
                     early_stop_trigger += 1
 
             # Training
             loss = train(model, train_loader, optimizer, criterion, args)
-            all_loss[iter_] = loss
-            all_accuracy[iter_] = val_accuracy
+            all_loss[train_iter] = loss
+            all_accuracy[train_iter] = val_accuracy
             # Frequency for Printing Accuracy and Loss
-            if iter_ % args.print_freq == 0:
+            if train_iter % args.print_freq == 0:
                 pbar.set_description(
-                    f'Train Epoch: {iter_}/{args.train_epochs} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
+                    f'Train Epoch: {train_iter}/{args.train_epochs} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
             if early_stop_trigger > args.early_stop:
                 break
 
             comp1 = utils.print_nonzeros(model, writer, _ite)
-        best_val_model = torch.load(f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/{_ite}_model_{args.prune_type}.pt")
+        best_val_model = torch.load(f"{os.getcwd()}/saves/{args.method}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/{_ite}_model_{args.prune_type}.pt")
         test_accuracy = test(best_val_model, test_loader, criterion)
         print(f'Test Accuracy: {test_accuracy}')
         writer.add_scalar('Accuracy/val', best_accuracy, sparsity)
         writer.add_scalar('Accuracy/test', test_accuracy, sparsity)
         bestacc[_ite] = best_accuracy
         testacc[_ite] = test_accuracy
-        utils.plot_sparsity_testacc(sparsity_[:_ite+1], testacc[:_ite+1], args)
+        fig = utils.plot_sparsity_testacc(sparsity_[:train_iter+1], testacc[:train_iter+1], args)
+        writer.add_figure('sparsity_testacc', fig, train_iter)
         # Plotting Loss (Training), Accuracy (Testing), args.prune_rounds Curve
         #NOTE Loss is computed for every args.prune_rounds while Accuracy is computed only for every {args.valid_freq} args.prune_roundss. Therefore Accuracy saved is constant during the uncomputed args.prune_roundss.
         #NOTE Normalized the accuracy to [0,100] for ease of plotting.
         plt.plot(np.arange(1,(args.train_epochs)+1), 100*(all_loss - np.min(all_loss))/np.ptp(all_loss).astype(float), c="blue", label="Loss") 
         plt.plot(np.arange(1,(args.train_epochs)+1), all_accuracy, c="red", label="Accuracy") 
-        plt.title(f"Loss Vs Accuracy Vs args.prune_roundss ({args.dataset},{args.arch_type})") 
+        plt.title(f"Loss Vs Accuracy Vs args.prune_roundss ({args.dataset},{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent})") 
         plt.xlabel("args.prune_roundss") 
         plt.ylabel("Loss and Accuracy") 
         plt.legend() 
         plt.grid(color="gray") 
-        utils.checkdir(f"{os.getcwd()}/plots/lt/{args.arch_type}/{args.dataset}/")
-        plt.savefig(f"{os.getcwd()}/plots/lt/{args.arch_type}/{args.dataset}/{args.prune_type}_LossVsAccuracy_{comp1}.png", dpi=1200) 
+        utils.checkdir(f"{os.getcwd()}/plots/lt/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/")
+        plt.savefig(f"{os.getcwd()}/plots/lt/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/{args.prune_type}_LossVsAccuracy_{comp1}.png", dpi=1200) 
         plt.close()
 
         # Dump Plot values
-        utils.checkdir(f"{os.getcwd()}/dumps/lt/{args.arch_type}/{args.dataset}/")
-        all_loss.dump(f"{os.getcwd()}/dumps/lt/{args.arch_type}/{args.dataset}/{args.prune_type}_all_loss_{comp1}.dat")
-        all_accuracy.dump(f"{os.getcwd()}/dumps/lt/{args.arch_type}/{args.dataset}/{args.prune_type}_all_accuracy_{comp1}.dat")
-        
-        # Dumping mask
-        utils.checkdir(f"{os.getcwd()}/dumps/lt/{args.arch_type}/{args.dataset}/")
-        with open(f"{os.getcwd()}/dumps/lt/{args.arch_type}/{args.dataset}/{args.prune_type}_mask_{comp1}.pkl", 'wb') as fp:
-            pickle.dump(mask, fp)
+        utils.checkdir(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/")
+        all_loss.dump(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/{args.prune_type}_all_loss_{comp1}.dat")
+        all_accuracy.dump(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/{args.prune_type}_all_accuracy_{comp1}.dat")
         
         # Making variables into 0
         best_accuracy = 0
@@ -260,22 +260,22 @@ def main(args, ITE=0):
         all_accuracy = np.zeros(args.train_epochs,float)
 
     # Dumping Values for Plotting
-    utils.checkdir(f"{os.getcwd()}/dumps/lt/{args.arch_type}/{args.dataset}/")
-    comp.dump(f"{os.getcwd()}/dumps/lt/{args.arch_type}/{args.dataset}/{args.prune_type}_compression.dat")
-    bestacc.dump(f"{os.getcwd()}/dumps/lt/{args.arch_type}/{args.dataset}/{args.prune_type}_bestaccuracy.dat")
+    utils.checkdir(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/")
+    comp.dump(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/{args.prune_type}_compression.dat")
+    bestacc.dump(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/{args.prune_type}_bestaccuracy.dat")
 
     # Plotting
     a = np.arange(args.prune_rounds)
     plt.plot(a, bestacc, c="blue", label="Winning tickets") 
-    plt.title(f"Test Accuracy vs Unpruned Weights Percentage ({args.dataset},{args.arch_type})") 
+    plt.title(f"Test Accuracy vs Unpruned Weights Percentage ({args.dataset},{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent})") 
     plt.xlabel("Unpruned Weights Percentage") 
     plt.ylabel("test accuracy") 
     plt.xticks(a, comp, rotation ="vertical") 
     plt.ylim(0,100)
     plt.legend() 
     plt.grid(color="gray") 
-    utils.checkdir(f"{os.getcwd()}/plots/lt/{args.arch_type}/{args.dataset}/")
-    plt.savefig(f"{os.getcwd()}/plots/lt/{args.arch_type}/{args.dataset}/{args.prune_type}_AccuracyVsWeights.png", dpi=1200) 
+    utils.checkdir(f"{os.getcwd()}/plots/lt/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/")
+    plt.savefig(f"{os.getcwd()}/plots/lt/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/{args.prune_type}_AccuracyVsWeights.png", dpi=1200) 
     plt.close()                    
    
 # Function for Training
@@ -300,10 +300,7 @@ def train(model, train_loader, optimizer, criterion, args):
                 p.grad.data = grad_tensor.to(device)
 
         optimizer.step()
-        if random.uniform(0, 1) < args.prune_prob:
-            prune.l1_unstructured(model.fc1, name='weight', amount=args.prune_ratio)
-            prune.l1_unstructured(model.fc2, name='weight', amount=args.prune_ratio)
-            prune.l1_unstructured(model.fc3, name='weight', amount=0.)
+        prune_and_reconnect(model, args.prune_prob, args.prune_ratio * 0.01)
     return train_loss.item()
 
 # Function for Testing
@@ -398,6 +395,37 @@ def get_mask(mask, model):
         step += 1 
     return mask
 
+def prune_and_reconnect(model, prune_prob, prune_ratio):
+    if random.uniform(0, 1) < prune_prob:
+        prune_count = []
+        mask_bef_pru = []
+        for name, param in model.named_buffers():
+            prune_count.append(int(np.rint((torch.count_nonzero(param.data)).cpu().numpy() * prune_ratio)))
+            mask_bef_pru.append(param.data)
+        # prune the connections
+        prune.l1_unstructured(model.fc1, name='weight', amount=prune_ratio)
+        prune.l1_unstructured(model.fc2, name='weight', amount=prune_ratio)
+        prune.l1_unstructured(model.fc3, name='weight', amount=prune_ratio/2)
+        # reconnect the zeroed connections
+        i = 0
+        for module in list(model.children()):
+            mask = mask_bef_pru[i]
+            if i == 2:
+                num_reconnect = prune_count[i] // 4
+            else:
+                num_reconnect = prune_count[i] // 2 # add less connection than prune
+            zero_indices = (mask.view(-1) == 0).nonzero()[0:num_reconnect]
+        #     # shuffle it
+            idx = torch.randperm(zero_indices.nelement())
+            zero_indices = zero_indices.view(-1)[idx].view(zero_indices.size())[0:num_reconnect]
+    
+            (list(module.named_buffers())[0][1]).view(-1)[zero_indices] = 1.
+            i += 1
+
+
+        
+
+        
 
 if __name__=="__main__":
     
