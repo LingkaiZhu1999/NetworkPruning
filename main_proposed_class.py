@@ -12,6 +12,7 @@ import torchvision
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import matplotlib.pyplot as plt
+from torchmetrics import MeanMetric
 import os
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.utils as vutils
@@ -22,6 +23,7 @@ import torch.nn.utils.prune as prune
 # Custom Libraries
 import utils
 import random
+import matplotlib.pyplot as plt
 
 sns.set_style('darkgrid')
 
@@ -33,10 +35,10 @@ parser.add_argument("--start_prune_round", default=0, type=int)
 parser.add_argument("--train_epochs", default=200, type=int)
 parser.add_argument("--print_freq", default=1, type=int)
 parser.add_argument("--valid_freq", default=1, type=int)
-parser.add_argument("--early_stop", default=50, type=int)
+parser.add_argument("--early_stop", default=25, type=int)
 parser.add_argument("--resume", action="store_true")
 parser.add_argument("--prune_type", default="local", type=str, help="local | global")
-parser.add_argument("--device", default="cuda:1", type=str)
+parser.add_argument("--device", default="cuda:0", type=str)
 parser.add_argument("--dataset", default="mnist", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
 parser.add_argument("--arch_type", default="fc1", type=str, help="fc1 | advanced_dropout_fc| lenet5 | alexnet | vgg16 | resnet18 | densenet121")
 parser.add_argument("--initial_percent", default=100, type=float, help='percentage of the weights that is trainable and initialized')
@@ -48,9 +50,6 @@ parser.add_argument("--weight_decay", default=1.2e-3, type=float, help="weight d
 parser.add_argument("--seed", default=1, type=int)
 
 args = parser.parse_args()
-with open(f"{os.getcwd()}/saves/{args.method}/{args.arch_type}_lr_{args.lr}_initial_percent_{args.initial_percent}/{args.dataset}/args.txt", 'w') as f:
-    for arg in vars(args):
-        print('%s: %s' %(arg, getattr(args, arg)), file=f) 
 torch.cuda.manual_seed_all(args.seed)
 class Proposed_prune():
     def __init__(self, args) -> None:
@@ -74,11 +73,13 @@ class Proposed_prune():
         if args.dataset == "mnist":
             traindataset = datasets.MNIST('../data', train=True, download=True, transform=transform)
             testdataset = datasets.MNIST('../data', train=False, transform=transform)
+            split = [55000, 5000]
             from archs.mnist import AlexNet, LeNet5, fc1, advanced_dropout_fc, vgg, resnet
 
         elif args.dataset == "cifar10":
             traindataset = datasets.CIFAR10('../data', train=True, download=True,transform=transform)
-            testdataset = datasets.CIFAR10('../data', train=False, transform=transform)      
+            testdataset = datasets.CIFAR10('../data', train=False, transform=transform)   
+            split = [45000, 5000]   
             from archs.cifar10 import AlexNet, LeNet5, fc1, vgg, resnet, densenet 
 
         elif args.dataset == "fashionmnist":
@@ -94,7 +95,7 @@ class Proposed_prune():
             print('Wrong dataset choice')
             exit()
         
-        train_dataset, val_dataset = torch.utils.data.random_split(traindataset, [55000, 5000], generator=torch.Generator().manual_seed(args.seed))
+        train_dataset, val_dataset = torch.utils.data.random_split(traindataset, split, generator=torch.Generator().manual_seed(args.seed))
         self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
         self.val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
         #train_loader = cycle(train_loader)
@@ -130,10 +131,13 @@ class Proposed_prune():
             prune.global_unstructured(parameters_to_prune, pruning_method=prune.RandomUnstructured, amount=1.0-args.initial_percent*0.01)
         else:
             raise Exception('Invalid prune type.')
-        self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/"
-        self.plot_path = f"{os.getcwd()}/plots/lt/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/"
+        self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/"
+        self.plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/"
         utils.checkdir(self.save_path)
         utils.checkdir(self.plot_path)
+        with open(os.path.join(self.save_path, "args.txt"), 'w') as f:
+            for arg in vars(args):
+                print('%s: %s' %(arg, getattr(args, arg)), file=f) 
     
     def prune(self, ):
         writer = SummaryWriter(self.save_path)
@@ -148,67 +152,68 @@ class Proposed_prune():
             print(name, param.size())
         bestacc = 0.0
         best_accuracy = 0
-        comp = np.zeros(args.prune_rounds,float)
-        bestacc = np.zeros(args.prune_rounds,float)
-        testacc = np.zeros(args.prune_rounds, float)
-        sparsity_ = np.zeros(args.prune_rounds, float)
+        comp = np.zeros(args.train_epochs,float)
+        bestacc = np.zeros(args.train_epochs,float)
+        testacc = np.zeros(args.train_epochs, float)
+        sparsity_ = np.zeros(args.train_epochs, float)
         step = 0
         all_loss = np.zeros(args.train_epochs,float)
         all_accuracy = np.zeros(args.train_epochs,float)
         early_stop_trigger = 0
 
-
-        for _ite in range(args.start_prune_round, args.prune_rounds):
-            if not _ite == 0: # don't prune for the first running round, because we want the model to be well trained before we prune it.
-                print(_ite)
-                # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            print(f"\n--- Pruning Level [{_ite}/{args.prune_rounds}]: ---")
-
             # Print the table of Nonzeros in each layer
-            comp1 = utils.print_nonzeros(self.model, writer, _ite)
-            sparsity = round(100.0-comp1, 1)
-            sparsity_[_ite] = sparsity
-            comp[_ite] = comp1
-            pbar = tqdm(range(args.train_epochs))
+        comp1 = utils.print_nonzeros(self.model, writer, 0)
+        sparsity = round(100.0-comp1, 1)
+        sparsity_[0] = sparsity
+        comp[0] = comp1
+        pbar = tqdm(range(args.train_epochs))
 
-            for train_iter in pbar:
-                # Frequency for Testing
-                if train_iter % args.valid_freq == 0:
-                    val_accuracy = self.test(self.model, self.val_loader, criterion)
+        for train_iter in pbar:
+            # Frequency for Testing
+            if train_iter % args.valid_freq == 0:
+                val_accuracy = self.test(self.model, self.val_loader, criterion)
 
-                    # Save Weights
-                    if val_accuracy > best_accuracy:
-                        best_accuracy = val_accuracy
-                        utils.checkdir(self.save_path)
-                        torch.save(self.model, os.path.join(self.save_path, f"{_ite}_model_{args.prune_type}.pt"))
-                        early_stop_trigger = 0
-                    else:
-                        early_stop_trigger += 1
+                # Save Weights
+                if val_accuracy > best_accuracy:
+                    best_accuracy = val_accuracy
+                    early_stop_trigger = 0
+                else:
+                    early_stop_trigger += 1
+            
+            # Training
+            loss = self.train(self.model, self.train_loader, optimizer, criterion, self.args)
+            torch.save(self.model, os.path.join(self.save_path, f"{train_iter}_model_{args.prune_type}.pt"))
+            all_loss[train_iter] = loss
+            all_accuracy[train_iter] = val_accuracy
+            # Frequency for Printing Accuracy and Loss
+            if train_iter % args.print_freq == 0:
+                pbar.set_description(
+                    f'Train Epoch: {train_iter}/{args.train_epochs} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
+            if early_stop_trigger > args.early_stop:
+                break
 
-                # Training
-                loss = self.train(self.model, self.train_loader, optimizer, criterion, self.args)
-                all_loss[train_iter] = loss
-                all_accuracy[train_iter] = val_accuracy
-                # Frequency for Printing Accuracy and Loss
-                if train_iter % args.print_freq == 0:
-                    pbar.set_description(
-                        f'Train Epoch: {train_iter}/{args.train_epochs} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
-                if early_stop_trigger > args.early_stop:
-                    break
+            comp1 = utils.print_nonzeros(self.model, writer, train_iter)
+            sparsity_[train_iter] = round(100.0-comp1, 1)
+            # best_val_model = torch.load(os.path.join(self.save_path, f"{train_iter}_model_{args.prune_type}.pt"))
+            test_accuracy = self.test(self.model, self.test_loader, criterion)
+            print(f'Test Accuracy: {test_accuracy}')
+            writer.add_scalar('Accuracy_sparsity/val', best_accuracy, sparsity)
+            writer.add_scalar('Accuracy_sparsity/test', test_accuracy, sparsity)
+            writer.add_scalar('Accuracy_epoch/test', test_accuracy, train_iter)
+            bestacc[0] = best_accuracy
+            testacc[train_iter] = test_accuracy
+            fig = utils.plot_sparsity_testacc(sparsity_[:train_iter+1], testacc[:train_iter+1], self.plot_path)
+            writer.add_figure('sparsity_testacc', fig, train_iter)
+        for name, p in self.model.named_parameters():
+            weight_nz = p[torch.nonzero(p, as_tuple=True)]
+            plt.hist(weight_nz.cpu().data.view(-1), bins=20)
+            plt.savefig(os.path.join(self.plot_path, f"{name}.png"))
+            plt.close()
 
-                comp1 = utils.print_nonzeros(self.model, writer, _ite)
-                # best_val_model = torch.load(os.path.join(self.save_path, f"{_ite}_model_{args.prune_type}.pt"))
-                test_accuracy = self.test(self.model, self.test_loader, criterion)
-                print(f'Test Accuracy: {test_accuracy}')
-                writer.add_scalar('Accuracy/val', best_accuracy, sparsity)
-                writer.add_scalar('Accuracy/test', test_accuracy, sparsity)
-                bestacc[_ite] = best_accuracy
-                testacc[_ite] = test_accuracy
-                fig = utils.plot_sparsity_testacc(sparsity_[:train_iter+1], testacc[:train_iter+1], args)
-                writer.add_figure('sparsity_testacc', fig, train_iter)
 
 
     def train(self, model, train_loader, optimizer, criterion, args):
+        metric = MeanMetric()
         EPS = 1e-6
         model.train()
         for batch_idx, (imgs, targets) in enumerate(train_loader):
@@ -218,7 +223,7 @@ class Proposed_prune():
             output = model(imgs)
             train_loss = criterion(output, targets)
             train_loss.backward()
-
+            metric.update(train_loss.detach().cpu())
             # Freezing Pruned weights by making their gradients Zero
             for name, p in model.named_parameters():
                 if 'weight' in name:
@@ -229,7 +234,8 @@ class Proposed_prune():
 
             optimizer.step()
             self.prune_and_reconnect(model, args.prune_prob, args.prune_ratio * 0.01)
-        return train_loss.item()
+        
+        return metric.compute().item()
 
     def test(self, model, test_loader, criterion):
         model.eval()
@@ -256,13 +262,16 @@ class Proposed_prune():
             # prune the connections
             prune.l1_unstructured(model.fc1, name='weight', amount=prune_ratio)
             prune.l1_unstructured(model.fc2, name='weight', amount=prune_ratio)
+            # if prune_count[2] / 2 > 1:
             prune.l1_unstructured(model.fc3, name='weight', amount=prune_ratio/2)
+            # else:
+                # prune.l1_unstructured(model.fc3, name='weight', amount=1)
             # reconnect the zeroed connections
             i = 0
             for module in list(model.children()):
                 mask = mask_bef_pru[i]
                 if i == 2:
-                    num_reconnect = prune_count[i] // 4
+                    num_reconnect = prune_count[i] // 4 
                 else:
                     num_reconnect = prune_count[i] // 2 # add less connection than prune
                 zero_indices = (mask.view(-1) == 0).nonzero()[0:num_reconnect]

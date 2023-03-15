@@ -26,7 +26,8 @@ import PIL
 sns.set_style('darkgrid')
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--lr",default=0.0002, type=float, help="Learning rate") # learning rate have a big effect
+parser.add_argument("--method", default="LTH", help="name of the method, it is Lottery Ticket Hypothesis")
+parser.add_argument("--lr",default=0.01, type=float, help="Learning rate") # learning rate have a big effect
 parser.add_argument("--batch_size", default=60, type=int)
 parser.add_argument("--start_prune_prune_round", default=0, type=int)
 parser.add_argument("--train_epochs", default=500, type=int)
@@ -37,10 +38,11 @@ parser.add_argument("--resume", action="store_true")
 parser.add_argument("--retrain_type", default="original", type=str, help="original | reinit")
 parser.add_argument("--prune_type", default="local", help="local | global")
 parser.add_argument("--gpu", default="1", type=str)
-parser.add_argument("--dataset", default="mnist", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
-parser.add_argument("--arch_type", default="lenet5", type=str, help="fc1 | advanced_dropout_fc | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
+parser.add_argument("--dataset", default="cifar10", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
+parser.add_argument("--arch_type", default="fc1", type=str, help="fc1 | advanced_dropout_fc | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
 parser.add_argument("--prune_percent", default=20, type=int, help="Pruning percent")
 parser.add_argument("--prune_rounds", default=30, type=int, help="Pruning args.prune_roundss count")
+parser.add_argument("--optimizer", default="sgd", help="adam | sgd")
 parser.add_argument("--weight_decay", default=1.2e-3, type=float, help="weight decay for adam optim")
 parser.add_argument("--seed", default=1, type=int)
 
@@ -50,14 +52,17 @@ args = parser.parse_args()
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   
 os.environ["CUDA_VISIBLE_DEVICES"]=args.gpu
-utils.checkdir(f"{os.getcwd()}/saves/{args.arch_type}_lr_{args.lr}/{args.dataset}/")
-with open(f"{os.getcwd()}/saves/{args.arch_type}_lr_{args.lr}/{args.dataset}/args.txt", 'w') as f:
+save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}/{args.dataset}/"
+plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}/{args.dataset}/"
+utils.checkdir(save_path)
+utils.checkdir(plot_path)
+with open(os.path.join(save_path, "args.txt"), 'w') as f:
     for arg in vars(args):
         print('%s: %s' %(arg, getattr(args, arg)), file=f) 
 # Main
 def main(args, ITE=0):
     # tensorboard
-    writer = SummaryWriter(f"{os.getcwd()}/saves/{args.arch_type}_lr_{args.lr}/{args.dataset}/")
+    writer = SummaryWriter(save_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     reinit = True if args.retrain_type=="reinit" else False
     torch.cuda.manual_seed_all(args.seed)
@@ -78,11 +83,13 @@ def main(args, ITE=0):
         traindataset = datasets.MNIST('../data', train=True, download=True,transform=transform)
         testdataset = datasets.MNIST('../data', train=False, transform=transform)
         from archs.mnist import AlexNet, advanced_dropout_fc, LeNet5, fc1, vgg, resnet
+        split = [55000, 5000]
 
     elif args.dataset == "cifar10":
         traindataset = datasets.CIFAR10('../data', train=True, download=True,transform=transform)
         testdataset = datasets.CIFAR10('../data', train=False, transform=transform)      
-        from archs.cifar10 import AlexNet, LeNet5, fc1, vgg, resnet, densenet 
+        from archs.cifar10 import AlexNet, LeNet5, fc1, vgg, resnet, densenet
+        split = [45000, 5000]
 
     elif args.dataset == "fashionmnist":
         traindataset = datasets.FashionMNIST('../data', train=True, download=True,transform=transform)
@@ -100,7 +107,7 @@ def main(args, ITE=0):
         print("\nWrong Dataset choice \n")
         exit()
 
-    train_dataset, val_dataset = torch.utils.data.random_split(traindataset, [55000, 5000], generator=torch.Generator().manual_seed(args.seed))
+    train_dataset, val_dataset = torch.utils.data.random_split(traindataset, split, generator=torch.Generator().manual_seed(args.seed))
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
     #train_loader = cycle(train_loader)
@@ -137,9 +144,14 @@ def main(args, ITE=0):
 
     # Copying and Saving Initial State
     initial_state_dict = copy.deepcopy(model.state_dict())
-    torch.save(model, f"{os.getcwd()}/saves/{args.arch_type}_lr_{args.lr}/{args.dataset}/initial_state_dict_{args.retrain_type}.pt")
+    torch.save(model, os.path.join(save_path, "initial_state_dict_{args.retrain_type}.pt"))
     # Optimizer and Loss
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == 'adam':
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    elif args.optimizer == 'sgd':
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+    else:
+        raise Exception('wrong optimizer, has to be adam or sgd')
     criterion = nn.CrossEntropyLoss() # Default was F.nll_loss
 
     # Layer Looper
@@ -189,7 +201,12 @@ def main(args, ITE=0):
                 step = 0
             else:
                 original_initialization(mask, initial_state_dict)
-            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            if args.optimizer == 'adam':
+                optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            elif args.optimizer == 'sgd':
+                optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+            else:
+                raise Exception('wrong optimizer, has to be adam or sgd')
         print(f"\n--- Pruning Level [{ITE}:{prune_round}/{args.prune_rounds}]: ---")
 
         # Print the table of Nonzeros in each layer
@@ -208,8 +225,7 @@ def main(args, ITE=0):
                 # Save Weights
                 if val_accuracy > best_accuracy:
                     best_accuracy = val_accuracy
-                    utils.checkdir(f"{os.getcwd()}/saves/{args.arch_type}_lr_{args.lr}/{args.dataset}/")
-                    torch.save(model,f"{os.getcwd()}/saves/{args.arch_type}_lr_{args.lr}/{args.dataset}/{prune_round}_model_{args.retrain_type}.pt")
+                    torch.save(model, os.path.join(save_path, "{prune_round}_model_{args.retrain_type}.pt"))
                     early_stop_trigger = 0
                 else:
                     early_stop_trigger += 1
@@ -224,14 +240,14 @@ def main(args, ITE=0):
                     f'Train Epoch: {iter_}/{args.train_epochs} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
             if early_stop_trigger > args.early_stop:
                 break
-        best_val_model = torch.load(f"{os.getcwd()}/saves/{args.arch_type}_lr_{args.lr}/{args.dataset}/{prune_round}_model_{args.retrain_type}.pt")
+        best_val_model = torch.load(os.path.join(save_path, "{prune_round}_model_{args.retrain_type}.pt"))
         test_accuracy = test(best_val_model, test_loader, criterion)
         print(f'Test Accuracy: {test_accuracy}')
         writer.add_scalar('Accuracy/val', best_accuracy, sparsity)
         writer.add_scalar('Accuracy/test', test_accuracy, sparsity)
         bestacc[prune_round] = best_accuracy
         testacc[prune_round] = test_accuracy
-        fig = utils.plot_sparsity_testacc(sparsity_[:prune_round+1], testacc[:prune_round+1], args)
+        fig = utils.plot_sparsity_testacc(sparsity_[:prune_round+1], testacc[:prune_round+1], plot_path)
         writer.add_figure('sparsity_testacc', fig, prune_round)
         # Plotting Loss (Training), Accuracy (Testing), args.prune_rounds Curve
         #NOTE Loss is computed for every args.prune_rounds while Accuracy is computed only for every {args.valid_freq} args.prune_roundss. Therefore Accuracy saved is constant during the uncomputed args.prune_roundss.
@@ -243,8 +259,7 @@ def main(args, ITE=0):
         plt.ylabel("Loss and Accuracy") 
         plt.legend() 
         plt.grid(color="gray") 
-        utils.checkdir(f"{os.getcwd()}/plots/lt/{args.arch_type}_lr_{args.lr}/{args.dataset}/")
-        plt.savefig(f"{os.getcwd()}/plots/lt/{args.arch_type}_lr_{args.lr}/{args.dataset}/{args.retrain_type}_LossVsAccuracy_{comp1}.png", dpi=1200) 
+        plt.savefig(os.path.join(plot_path, "{args.retrain_type}_LossVsAccuracy_{comp1}.png"), dpi=1200) 
         plt.close()
 
         # Dump Plot values

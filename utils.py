@@ -6,6 +6,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import copy
 import io
+import utils
 
 #ANCHOR Print table of zeros and non-zeros count
 def print_nonzeros(model, writer, _ite):
@@ -43,15 +44,15 @@ def original_initialization(mask_temp, initial_state_dict):
             param.data = initial_state_dict[name]
     step = 0
 
-def plot_sparsity_testacc(sparsity, testacc, args):
+def plot_sparsity_testacc(sparsity, testacc, plot_path):
     fig = plt.figure()
     plt.plot(sparsity, testacc)
     plt.xlabel('Sparsity')
-    plt.xticks(sparsity)
+    # plt.xticks(sparsity)
     # plt.set_
     plt.ylabel('Test accuracy')
-    plt.ylim([70,100])
-    plt.savefig(f"{os.getcwd()}/plots/lt/{args.arch_type}/{args.dataset}/{args.prune_type}_{args.prune_percent}_{args.prune_rounds}_.png", dpi=1200)
+    # plt.ylim([70,100])
+    plt.savefig(os.path.join(plot_path, "acc_vs_sparsity.png"), dpi=1200)
     plt.close()
     return fig
 
