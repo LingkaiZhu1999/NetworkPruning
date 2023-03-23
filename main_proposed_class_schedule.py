@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 sns.set_style('darkgrid')
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--method", default="proposed_prune_ratio_fixed_experimental", help="the proposed method")
+parser.add_argument("--method", default="proposed_prune_ratio_fixed_experimental_exp", help="the proposed method")
 parser.add_argument("--lr", default=0.01, type=float, help="Learning rate")
 parser.add_argument("--batch_size", default=60, type=int)
 parser.add_argument("--start_prune_round", default=0, type=int)
@@ -45,7 +45,7 @@ parser.add_argument("--initial_percent", default=100, type=float, help='percenta
 parser.add_argument("--prune_rounds", default=1, type=int, help="Pruning args.prune_roundss count")
 parser.add_argument("--prune_ratio", default=1, type=float, help="Prune ratio during train")
 parser.add_argument("--prune_prob", default=0.01, type=float, help="probability to prune during train")
-parser.add_argument("--target_ratio", default=2, type=float, )
+parser.add_argument("--target_ratio", default=1.8, type=float, )
 parser.add_argument("--optimizer", default="sgd", help="adam | sgd")
 parser.add_argument("--weight_decay", default=1.2e-3, type=float, help="weight decay for adam optim")
 parser.add_argument("--seed", default=1, type=int)
@@ -128,12 +128,18 @@ class Proposed_prune():
         for name, param in self.model.named_parameters():
             if 'weight' in name:
                 self.initial_num_weights.append(param.numel())
-                self.target_num_weight.append(int(np.rint(param.numel() * args.target_ratio * 0.01)))
+                if 'fc3' not in name:
+                    self.target_num_weight.append(int(np.rint(param.numel() * args.target_ratio * 0.01)))
+                else:
+                    self.target_num_weight.append(int(np.rint(param.numel() * 10 * 0.01))) # 5% for the output layer
         self.parameters_to_prune = tuple(self.parameters_to_prune)
         self.iter_per_epoch = int(np.ceil(len(train_dataset) / args.batch_size))
         self.total_iter = self.iter_per_epoch * args.train_epochs
-        self.prune_num_iter = (np.array(self.initial_num_weights) - np.array(self.target_num_weight)) / self.total_iter
-        print(self.prune_num_iter)
+        self.alpha_a = np.log(args.target_ratio*0.01)
+        self.alpha_b = np.log(10*0.01)
+        print(self.alpha_a, self.alpha_b)
+        # self.prune_num_iter = (np.array(self.initial_num_weights) - np.array(self.target_num_weight)) / self.total_iter 
+        # print(self.prune_num_iter)
         # self.total_num_weights = sum(p.numel() for name, p in self.model.named_parameters() if 'weight' in name)
         # self.target_num_weights = args.target_ratio * self.total_num_weights
         if args.prune_type == 'local':
@@ -279,10 +285,9 @@ class Proposed_prune():
             prune_count = []
             mask_bef_pru = []
             already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
-            prune_num_iter = self.prune_num_iter * train_iter
+            prune_num_iter = np.array(self.initial_num_weights) * np.array([self.exp_pruning_schedule(train_iter, self.alpha_a), self.exp_pruning_schedule(train_iter, self.alpha_a), self.exp_pruning_schedule(train_iter, self.alpha_b)])
             to_prune = prune_num_iter - already_pruned 
             to_prune = np.array([int(np.floor(a)) for a in to_prune])
-            print(prune_num_iter, already_pruned, to_prune)
             for name, param in model.named_buffers():
                 prune_count.append(int(np.floor((torch.count_nonzero(param.data)).cpu().numpy() * prune_ratio)))
                 mask_bef_pru.append(param.data)
@@ -319,6 +324,9 @@ class Proposed_prune():
             
                     (list(module.named_buffers())[0][1]).view(-1)[zero_indices] = 1.
                     i += 1
+    
+    def exp_pruning_schedule(self, cur_iter, alpha):
+        return 1. - np.exp(alpha * cur_iter / self.total_iter)
 
 def main():
     proposed_prune = Proposed_prune(args)
