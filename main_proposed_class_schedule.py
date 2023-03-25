@@ -38,16 +38,17 @@ parser.add_argument("--valid_freq", default=1, type=int)
 parser.add_argument("--early_stop", default=80, type=int)
 parser.add_argument("--resume", action="store_true")
 parser.add_argument("--prune_type", default="local", type=str, help="local | global")
-parser.add_argument("--device", default="cuda:1", type=str)
-parser.add_argument("--dataset", default="mnist", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
-parser.add_argument("--arch_type", default="fc1", type=str, help="fc1 | advanced_dropout_fc| lenet5 | alexnet | vgg16 | resnet18 | densenet121")
+parser.add_argument("--device", default="cuda:0", type=str)
+parser.add_argument("--dataset", default="cifar10", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
+parser.add_argument("--arch_type", default="alexnet", type=str, help="fc1 | advanced_dropout_fc| lenet5 | alexnet | vgg16 | resnet18 | densenet121")
 parser.add_argument("--initial_percent", default=100, type=float, help='percentage of the weights that is trainable and initialized')
 parser.add_argument("--prune_rounds", default=1, type=int, help="Pruning args.prune_roundss count")
 parser.add_argument("--prune_ratio", default=1, type=float, help="Prune ratio during train")
 parser.add_argument("--prune_prob", default=0.01, type=float, help="probability to prune during train")
-parser.add_argument("--target_ratio", default=1.8, type=float, )
+parser.add_argument("--target_ratio", default=1.9, type=float, )
 parser.add_argument("--optimizer", default="sgd", help="adam | sgd")
-parser.add_argument("--weight_decay", default=1.2e-3, type=float, help="weight decay for adam optim")
+parser.add_argument("--momentum", default=0.9, type=float)
+parser.add_argument("--weight_decay", default=0.0005, type=float, help="weight decay for adam optim")
 parser.add_argument("--seed", default=1, type=int)
 
 args = parser.parse_args()
@@ -162,17 +163,17 @@ class Proposed_prune():
     
     def prune(self, ):
         # plot the histogram of the initial distribution
-        for name, p in self.model.named_parameters():
-            weight_nz = p[torch.nonzero(p, as_tuple=True)]
-            plt.hist(weight_nz.cpu().data.view(-1), bins=30)
-            plt.savefig(os.path.join(self.plot_path, f"{name}_initial.png"))
-            plt.close()
+        # for name, p in self.model.named_parameters():
+        #     weight_nz = p[torch.nonzero(p, as_tuple=True)]
+        #     plt.hist(weight_nz.cpu().data.view(-1), bins=30)
+        #     plt.savefig(os.path.join(self.plot_path, f"{name}_initial.png"))
+        #     plt.close()
         writer = SummaryWriter(self.save_path)
         criterion = nn.CrossEntropyLoss()
         if args.optimizer == 'adam':
             optimizer = torch.optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         elif args.optimizer == 'sgd':
-            optimizer = torch.optim.SGD(self.model.parameters(), lr=args.lr)
+            optimizer = torch.optim.SGD(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum)
         else:
             raise Exception('wrong optimizer, has to be adam or sgd')
         for name, param in self.model.named_parameters():
@@ -187,8 +188,7 @@ class Proposed_prune():
         all_loss = np.zeros(args.train_epochs,float)
         all_accuracy = np.zeros(args.train_epochs,float)
         early_stop_trigger = 0
-
-            # Print the table of Nonzeros in each layer
+        # Print the table of Nonzeros in each layer
         comp1 = utils.print_nonzeros(self.model, writer, 0)
         sparsity = round(100.0-comp1, 1)
         sparsity_[0] = sparsity
@@ -231,11 +231,11 @@ class Proposed_prune():
             testacc[train_epoch] = test_accuracy
             fig = utils.plot_sparsity_testacc(sparsity_[:train_epoch+1], testacc[:train_epoch+1], self.plot_path)
             writer.add_figure('sparsity_testacc', fig, train_epoch)
-        for name, p in self.model.named_parameters():
-            weight_nz = p[torch.nonzero(p, as_tuple=True)]
-            plt.hist(weight_nz.cpu().data.view(-1), bins=30)
-            plt.savefig(os.path.join(self.plot_path, f"{name}.png"))
-            plt.close()
+        # for name, p in self.model.named_parameters():
+        #     weight_nz = p[torch.nonzero(p, as_tuple=True)]
+        #     plt.hist(weight_nz.cpu().data.view(-1), bins=30)
+        #     plt.savefig(os.path.join(self.plot_path, f"{name}.png"))
+        #     plt.close()
 
 
 
@@ -284,8 +284,15 @@ class Proposed_prune():
         if random.uniform(0, 1) < prune_prob:
             prune_count = []
             mask_bef_pru = []
+            prune_num_iter = []
             already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
-            prune_num_iter = np.array(self.initial_num_weights) * np.array([self.exp_pruning_schedule(train_iter, self.alpha_a), self.exp_pruning_schedule(train_iter, self.alpha_a), self.exp_pruning_schedule(train_iter, self.alpha_b)])
+            for i in range(len(self.parameters_to_prune)):
+                if i != len(self.parameters_to_prune) - 1:
+                    prune_num_iter.append(self.initial_num_weights[i] * self.exp_pruning_schedule(train_iter, self.alpha_a))
+                else:
+                    prune_num_iter.append(self.initial_num_weights[i] * self.exp_pruning_schedule(train_iter, self.alpha_b))
+            prune_num_iter = np.array(prune_num_iter)
+
             to_prune = prune_num_iter - already_pruned 
             to_prune = np.array([int(np.floor(a)) for a in to_prune])
             for name, param in model.named_buffers():
