@@ -24,21 +24,22 @@ import torch.nn.utils.prune as prune
 import utils
 import random
 import matplotlib.pyplot as plt
-
+from data import Data
+from archs.cifar10 import AlexNet, LeNet5, fc1, vgg, resnet, densenet 
 sns.set_style('darkgrid')
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--method", default="proposed_prune_ratio_fixed_experimental_exp", help="the proposed method")
+parser.add_argument("--method", default="proposed_prune_ratio_fixed_experimental_exp_1", help="the proposed method")
 parser.add_argument("--lr", default=0.01, type=float, help="Learning rate")
 parser.add_argument("--batch_size", default=60, type=int)
 parser.add_argument("--start_prune_round", default=0, type=int)
-parser.add_argument("--train_epochs", default=100, type=int)
+parser.add_argument("--train_epochs", default=200, type=int)
 parser.add_argument("--print_freq", default=1, type=int)
 parser.add_argument("--valid_freq", default=1, type=int)
-parser.add_argument("--early_stop", default=80, type=int)
+parser.add_argument("--early_stop", default=None, type=int)
 parser.add_argument("--resume", action="store_true")
 parser.add_argument("--prune_type", default="local", type=str, help="local | global")
-parser.add_argument("--device", default="cuda:0", type=str)
+parser.add_argument("--device", default="cuda:1", type=str)
 parser.add_argument("--dataset", default="cifar10", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
 parser.add_argument("--arch_type", default="alexnet", type=str, help="fc1 | advanced_dropout_fc| lenet5 | alexnet | vgg16 | resnet18 | densenet121")
 parser.add_argument("--initial_percent", default=100, type=float, help='percentage of the weights that is trainable and initialized')
@@ -46,6 +47,8 @@ parser.add_argument("--prune_rounds", default=1, type=int, help="Pruning args.pr
 parser.add_argument("--prune_ratio", default=1, type=float, help="Prune ratio during train")
 parser.add_argument("--prune_prob", default=0.01, type=float, help="probability to prune during train")
 parser.add_argument("--target_ratio", default=1.9, type=float, )
+parser.add_argument("--prune_conv1", default=False)
+parser.add_argument("--output_target_ratio", default=5, type=float)
 parser.add_argument("--optimizer", default="sgd", help="adam | sgd")
 parser.add_argument("--momentum", default=0.9, type=float)
 parser.add_argument("--weight_decay", default=0.0005, type=float, help="weight decay for adam optim")
@@ -60,52 +63,14 @@ class Proposed_prune():
         self.train_epochs = args.train_epochs
         self.args = args
 
-
-        self.mean = {
-        'mnist': (0.1307,),
-        'cifar10': (0.4914, 0.4822 ,0.4465),
-        'cifar100': (0.5071, 0.4867, 0.4408)
-        }
-        self.std = {
-        'mnist': (0.3081,),
-        'cifar10': (0.2470, 0.2435, 0.2616),
-        'cifar100': (0.2675, 0.2565, 0.2761),
-        }
-        transform=transforms.Compose([transforms.ToTensor(),transforms.Normalize(self.mean[args.dataset], self.std[args.dataset])])
-        if args.dataset == "mnist":
-            traindataset = datasets.MNIST('../data', train=True, download=True, transform=transform)
-            testdataset = datasets.MNIST('../data', train=False, transform=transform)
-            split = [55000, 5000]
-            from archs.mnist import AlexNet, LeNet5, fc1, advanced_dropout_fc, vgg, resnet
-
-        elif args.dataset == "cifar10":
-            traindataset = datasets.CIFAR10('../data', train=True, download=True,transform=transform)
-            testdataset = datasets.CIFAR10('../data', train=False, transform=transform)   
-            split = [45000, 5000]   
-            from archs.cifar10 import AlexNet, LeNet5, fc1, vgg, resnet, densenet 
-
-        elif args.dataset == "fashionmnist":
-            traindataset = datasets.FashionMNIST('../data', train=True, download=True,transform=transform)
-            testdataset = datasets.FashionMNIST('../data', train=False, transform=transform)
-            from archs.mnist import AlexNet, LeNet5, fc1, vgg, resnet 
-
-        elif args.dataset == "cifar100":
-            traindataset = datasets.CIFAR100('../data', train=True, download=True,transform=transform)
-            testdataset = datasets.CIFAR100('../data', train=False, transform=transform)   
-            from archs.cifar100 import AlexNet, fc1, LeNet5, vgg, resnet  
-        else:
-            print('Wrong dataset choice')
-            exit()
-        
-        train_dataset, val_dataset = torch.utils.data.random_split(traindataset, split, generator=torch.Generator().manual_seed(args.seed))
+        data = Data(args.seed)
+        train_dataset, val_dataset, testdataset = data.get_dataset(dataset=args.dataset)
         self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
         self.val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
         #train_loader = cycle(train_loader)
         self.test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=4,drop_last=True)
         if args.arch_type == "fc1":
             self.model = fc1.fc1().to(self.device)
-        elif args.arch_type == "advanced_dropout_fc":
-            self.model = advanced_dropout_fc.advanced_drop_fc().to(self.device)
         elif args.arch_type == "lenet5":
             self.model = LeNet5.LeNet5().to(self.device)
         elif args.arch_type == "alexnet":
@@ -116,7 +81,6 @@ class Proposed_prune():
             self.model = resnet.resnet18().to(self.device)   
         elif args.arch_type == "densenet121":
             self.model = densenet.densenet121().to(self.device)   
-        # If you want to add extra model paste here
         else:
             print("\nWrong Model choice\n")
             exit()
@@ -125,6 +89,12 @@ class Proposed_prune():
         self.target_num_weight = []
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                # if name == 'conv1':
+                #     if args.prune_conv1:
+                #         self.parameters_to_prune.append((module, 'weight'))
+                #     else:
+                #         print('skip the first conv2d for L1 unstructure global pruning')
+                # else:
                 self.parameters_to_prune.append((module, 'weight'))
         for name, param in self.model.named_parameters():
             if 'weight' in name:
@@ -132,27 +102,17 @@ class Proposed_prune():
                 if 'fc3' not in name:
                     self.target_num_weight.append(int(np.rint(param.numel() * args.target_ratio * 0.01)))
                 else:
-                    self.target_num_weight.append(int(np.rint(param.numel() * 10 * 0.01))) # 5% for the output layer
+                    self.target_num_weight.append(int(np.rint(param.numel() * args.output_target_ratio * 0.01))) # 5% for the output layer
         self.parameters_to_prune = tuple(self.parameters_to_prune)
         self.iter_per_epoch = int(np.ceil(len(train_dataset) / args.batch_size))
         self.total_iter = self.iter_per_epoch * args.train_epochs
         self.alpha_a = np.log(args.target_ratio*0.01)
-        self.alpha_b = np.log(10*0.01)
+        self.alpha_b = np.log(args.output_target_ratio*0.01)
         print(self.alpha_a, self.alpha_b)
         # self.prune_num_iter = (np.array(self.initial_num_weights) - np.array(self.target_num_weight)) / self.total_iter 
         # print(self.prune_num_iter)
         # self.total_num_weights = sum(p.numel() for name, p in self.model.named_parameters() if 'weight' in name)
         # self.target_num_weights = args.target_ratio * self.total_num_weights
-        if args.prune_type == 'local':
-            # i = 0
-            for layer, name in self.parameters_to_prune:
-                # i += 1
-                # if i != len(self.parameters_to_prune):
-                prune.random_unstructured(layer, name=name, amount=1.0-args.initial_percent*0.01)
-        elif args.prune_type == 'global':
-            prune.global_unstructured(self.parameters_to_prune, pruning_method=prune.RandomUnstructured, amount=1.0-args.initial_percent*0.01)
-        else:
-            raise Exception('Invalid prune type.')
         self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/"
         self.plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/"
         utils.checkdir(self.save_path)
@@ -186,7 +146,7 @@ class Proposed_prune():
         sparsity_ = np.zeros(args.train_epochs, float)
         step = 0
         all_loss = np.zeros(args.train_epochs,float)
-        all_accuracy = np.zeros(args.train_epochs,float)
+        valacc = np.zeros(args.train_epochs,float)
         early_stop_trigger = 0
         # Print the table of Nonzeros in each layer
         comp1 = utils.print_nonzeros(self.model, writer, 0)
@@ -211,12 +171,12 @@ class Proposed_prune():
             loss = self.train(self.model, self.train_loader, optimizer, criterion, train_epoch, self.args)
             torch.save(self.model, os.path.join(self.save_path, f"{train_epoch}_model_{args.prune_type}.pt"))
             all_loss[train_epoch] = loss
-            all_accuracy[train_epoch] = val_accuracy
+            valacc[train_epoch] = val_accuracy
             # Frequency for Printing Accuracy and Loss
             if train_epoch % args.print_freq == 0:
                 pbar.set_description(
                     f'Train Epoch: {train_epoch}/{args.train_epochs} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
-            if early_stop_trigger > args.early_stop:
+            if args.early_stop is not None and early_stop_trigger > args.early_stop:
                 break
 
             comp1 = utils.print_nonzeros(self.model, writer, train_epoch)
@@ -229,8 +189,10 @@ class Proposed_prune():
             writer.add_scalar('Accuracy_epoch/test', test_accuracy, train_epoch)
             bestacc[0] = best_accuracy
             testacc[train_epoch] = test_accuracy
-            fig = utils.plot_sparsity_testacc(sparsity_[:train_epoch+1], testacc[:train_epoch+1], self.plot_path)
-            writer.add_figure('sparsity_testacc', fig, train_epoch)
+            fig_test = utils.plot_sparsity_testacc(sparsity_[:train_epoch+1], testacc[:train_epoch+1], self.plot_path, name='test')
+            fig_val = utils.plot_sparsity_testacc(sparsity_[:train_epoch+1], valacc[:train_epoch+1], self.plot_path, name='val')
+            writer.add_figure('sparsity_testacc', fig_test, train_epoch)
+            writer.add_figure('sparsity_valacc', fig_val, train_epoch)
         # for name, p in self.model.named_parameters():
         #     weight_nz = p[torch.nonzero(p, as_tuple=True)]
         #     plt.hist(weight_nz.cpu().data.view(-1), bins=30)
@@ -273,7 +235,7 @@ class Proposed_prune():
             for data, target in test_loader:
                 data, target = data.to(self.device), target.to(self.device)
                 output = model(data)
-                test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
+                test_loss += criterion(output, target).item()  # sum up batch loss
                 pred = output.data.max(1, keepdim=True)[1]  # get the index of the max log-probability
                 correct += pred.eq(target.data.view_as(pred)).sum().item()
             test_loss /= len(test_loader.dataset)
@@ -287,16 +249,17 @@ class Proposed_prune():
             prune_num_iter = []
             already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
             for i in range(len(self.parameters_to_prune)):
-                if i != len(self.parameters_to_prune) - 1:
+                if not self.args.prune_conv1 and i == 0:
+                    prune_num_iter.append(0.)
+                elif i != len(self.parameters_to_prune) - 1:
                     prune_num_iter.append(self.initial_num_weights[i] * self.exp_pruning_schedule(train_iter, self.alpha_a))
                 else:
                     prune_num_iter.append(self.initial_num_weights[i] * self.exp_pruning_schedule(train_iter, self.alpha_b))
             prune_num_iter = np.array(prune_num_iter)
-
             to_prune = prune_num_iter - already_pruned 
             to_prune = np.array([int(np.floor(a)) for a in to_prune])
             for name, param in model.named_buffers():
-                prune_count.append(int(np.floor((torch.count_nonzero(param.data)).cpu().numpy() * prune_ratio)))
+                # prune_count.append(int(np.floor((torch.count_nonzero(param.data)).cpu().numpy() * prune_ratio)))
                 mask_bef_pru.append(param.data)
             # prune the connections
             if args.prune_type == 'local':
@@ -305,8 +268,9 @@ class Proposed_prune():
                     # i += 1
                     # if i != len(self.parameters_to_prune):
                     if to_prune[i] > 1:
+                        
                         prune.l1_unstructured(layer, name=name, amount=to_prune[i]*2)
-                        i += 1
+                    i += 1
                     # else:
                     #     # prune at half ratio for the last output layer
                     #     prune.l1_unstructured(layer, name=name, amount=prune_ratio/2)
