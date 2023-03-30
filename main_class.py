@@ -1,0 +1,293 @@
+# Importing Libraries
+import argparse
+import copy
+import os
+import sys
+import numpy as np
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+import matplotlib.pyplot as plt
+from torchmetrics import MeanMetric
+import os
+from torch.utils.tensorboard import SummaryWriter
+import torchvision.utils as vutils
+import seaborn as sns
+import torch.nn.init as init
+import pickle
+import torch.nn.utils.prune as prune
+# Custom Libraries
+import utils
+import random
+import matplotlib.pyplot as plt
+from data import Data
+from archs.cifar10 import AlexNet, LeNet5, fc1, resnet 
+
+sns.set_style('darkgrid')
+parser = argparse.ArgumentParser()
+parser.add_argument("--method", default="LTH", help="name of the method, it is Lottery Ticket Hypothesis")
+parser.add_argument("--lr",default=0.01, type=float, help="Learning rate") # learning rate have a big effect
+parser.add_argument("--batch_size", default=60, type=int)
+parser.add_argument("--start_prune_prune_round", default=0, type=int)
+parser.add_argument("--train_epochs", default=1, type=int)
+parser.add_argument("--print_freq", default=1, type=int)
+parser.add_argument("--valid_freq", default=1, type=int)
+parser.add_argument("--early_stop", default=15, type=int)
+parser.add_argument("--resume", action="store_true")
+parser.add_argument("--retrain_type", default="original", type=str, help="original | reinit")
+parser.add_argument("--prune_type", default="global", help="local | global")
+parser.add_argument("--device", default="cuda:0", type=str)
+parser.add_argument("--dataset", default="cifar10", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
+parser.add_argument("--arch_type", default="alexnet", type=str, help="fc1 | advanced_dropout_fc | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
+parser.add_argument("--prune_percent", default=20, type=int, help="Pruning percent")
+parser.add_argument("--prune_rounds", default=20, type=int, help="Pruning args.prune_roundss count")
+parser.add_argument("--prune_conv1", default=False)
+parser.add_argument("--optimizer", default="sgd", help="adam | sgd")
+parser.add_argument("--momentum", default=0.9, type=float)
+parser.add_argument("--weight_decay", default=0.0005, type=float, help="weight decay for adam optim")
+parser.add_argument("--seed", default=1, type=int)
+args = parser.parse_args()
+
+class LTH():
+    def __init__(self, args) -> None:
+        self.device = args.device
+        if args.arch_type == "fc1":
+            self.model = fc1.fc1().to(self.device)
+        elif args.arch_type == "lenet5":
+            self.model = LeNet5.LeNet5().to(self.device)
+        elif args.arch_type == "alexnet":
+            self.model = AlexNet.AlexNet().to(self.device)
+        elif args.arch_type == "vgg16":
+            self.model = VGG16.VGG16().to(self.device)  
+        elif args.arch_type == "resnet18":
+            self.model = resnet.resnet18().to(self.device)   
+            args.lr = 0.1
+            args.weight_decay = 0.0001
+            args.momentum = 0.9
+        elif args.arch_type == "densenet121":
+            self.model = densenet.densenet121().to(self.device)   
+        # If you want to add extra model paste here
+        else:
+            print("\nWrong Model choice\n")
+            exit()
+        self.batch_size = args.batch_size
+        self.train_epochs = args.train_epochs
+        self.args = args
+        data = Data(args.seed)
+        train_dataset, val_dataset, testdataset = data.get_dataset(dataset=args.dataset)
+        self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
+        self.val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
+        #train_loader = cycle(train_loader)
+        self.test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=4,drop_last=True)
+        
+        self.parameters_to_prune = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                if name == 'conv1':
+                    if args.prune_conv1:
+                        self.parameters_to_prune.append((module, 'weight'))
+                else:
+                    self.parameters_to_prune.append((module, 'weight'))
+            
+        self.parameters_to_prune = tuple(self.parameters_to_prune)
+
+        self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}/{args.dataset}/"
+        self.plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}/{args.dataset}/"
+        utils.checkdir(self.save_path)
+        utils.checkdir(self.plot_path)
+        with open(os.path.join(self.save_path, "args.txt"), 'w') as f:
+            for arg in vars(args):
+                print('%s: %s' %(arg, getattr(args, arg)), file=f) 
+
+        self.mask = [None] * len(self.parameters_to_prune)
+        self.initial_state_dict = copy.deepcopy(self.model.state_dict())
+        torch.save(self.model, os.path.join(self.save_path, "initial_state_dict_{args.retrain_type}.pt"))
+
+    def prune(self, ):
+        bestacc = 0.0
+        best_accuracy = 0
+        comp = np.zeros(self.args.prune_rounds,float)
+        bestacc = np.zeros(self.args.prune_rounds,float)
+        testacc = np.zeros(self.args.prune_rounds, float)
+        sparsity_ = np.zeros(self.args.prune_rounds, float)
+        step = 0
+        all_loss = np.zeros(self.args.train_epochs,float)
+        all_accuracy = np.zeros(self.args.train_epochs,float)
+        early_stop_trigger = 0
+        reinit = True if args.retrain_type=="reinit" else False
+        writer = SummaryWriter(self.save_path)
+        if self.args.optimizer == 'adam':
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.weight_decay)
+        elif self.args.optimizer == 'sgd':
+            optimizer = torch.optim.SGD(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.weight_decay, momentum=self.args.momentum)
+        else:
+            raise Exception('wrong optimizer, has to be adam or sgd')
+        
+        criterion = nn.CrossEntropyLoss()
+        
+        for prune_round in range(self.args.start_prune_prune_round, self.args.prune_rounds):
+            
+            if not prune_round == 0: # don't prune for the first running prune_round, because we want the model to be well trained before we prune it.
+                print(prune_round)
+                self.prune_by_percentile(self.args.prune_percent * 0.01, self.parameters_to_prune)
+                self.get_mask()
+                if reinit:
+                    # model.apply(weight_init)
+                    step = 0
+                    for name, param in self.model.named_parameters():
+                        if 'weight' in name:
+                            param.data = (param.data * self.mask[step]).to(self.device)
+                            step = step + 1
+                    step = 0
+                else:
+                    self.original_initialization(self.mask, self.initial_state_dict)
+                if args.optimizer == 'adam':
+                    optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.weight_decay)
+                elif args.optimizer == 'sgd':
+                    optimizer = torch.optim.SGD(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.weight_decay, momentum=self.args.momentum)
+                else:
+                    raise Exception('wrong optimizer, has to be adam or sgd')
+            print(f"\n--- Pruning Level [{prune_round}/{self.args.prune_rounds}]: ---")
+            # Print the table of Nonzeros in each layer
+            comp1 = utils.print_nonzeros(self.model.named_parameters(), writer, prune_round)
+            sparsity = round(float(100.0 - comp1), 1)
+            sparsity_[prune_round] = sparsity
+            comp[prune_round] = comp1
+            pbar = tqdm(range(self.args.train_epochs))
+
+            for iter_ in pbar:
+
+                # Frequency for Testing
+                if iter_ % self.args.valid_freq == 0:
+                    val_accuracy = self.test(self.model, self.val_loader, criterion)
+                    writer.add_scalar(f'{prune_round}/valacc', val_accuracy, iter_)
+                    # Save Weights
+                    if val_accuracy > best_accuracy:
+                        best_accuracy = val_accuracy
+                        torch.save(self.model, os.path.join(self.save_path, f"{prune_round}_model_{self.args.retrain_type}.pt"))
+                        early_stop_trigger = 0
+                    else:
+                        early_stop_trigger += 1
+
+                # Training
+                loss = self.train(self.model, self.train_loader, optimizer, criterion)
+                all_loss[iter_] = loss
+                all_accuracy[iter_] = val_accuracy
+                # Frequency for Printing Accuracy and Loss
+                if iter_ % self.args.print_freq == 0:
+                    pbar.set_description(
+                        f'Train Epoch: {iter_}/{self.args.train_epochs} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
+                if early_stop_trigger > self.args.early_stop:
+                    break
+
+            best_val_model = torch.load(os.path.join(self.save_path, f"{prune_round}_model_{self.args.retrain_type}.pt"))
+            test_accuracy = self.test(best_val_model, self.test_loader, criterion)
+            del best_val_model
+            print(f'Test Accuracy: {test_accuracy}')
+            writer.add_scalar('Accuracy/val', best_accuracy, sparsity)
+            writer.add_scalar('Accuracy/test', test_accuracy, sparsity)
+            bestacc[prune_round] = best_accuracy
+            testacc[prune_round] = test_accuracy
+            fig = utils.plot_sparsity_testacc(sparsity_[:prune_round+1], testacc[:prune_round+1], self.plot_path)
+            writer.add_figure('sparsity_testacc', fig, prune_round)
+            
+            # Making variables into 0
+            best_accuracy = 0
+            all_loss = np.zeros(self.args.train_epochs,float)
+            all_accuracy = np.zeros(self.args.train_epochs,float)
+
+            torch.cuda.empty_cache()
+
+
+
+    def train(self, model, train_loader, optimizer, criterion):
+        metric = MeanMetric()
+        EPS = 1e-6
+        model.train()
+        for batch_idx, (imgs, targets) in enumerate(train_loader):
+            optimizer.zero_grad()
+            #imgs, targets = next(train_loader)
+            imgs, targets = imgs.to(self.device), targets.to(self.device)
+            output = model(imgs)
+            train_loss = criterion(output, targets)
+            train_loss.backward()
+            metric.update(train_loss.detach().cpu())
+            # Freezing Pruned weights by making their gradients Zero
+            for name, p in model.named_parameters():
+                if 'weight' in name:
+                    tensor = p.data
+                    grad_tensor = p.grad.data
+                    grad_tensor = torch.where(torch.abs(tensor) < EPS, 0, grad_tensor)
+                    p.grad.data = grad_tensor.to(self.device)
+
+            optimizer.step()
+        
+        return metric.compute().item()
+
+    def test(self, model, test_loader, criterion):
+        model.eval()
+        test_loss = 0
+        correct = 0
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                output = model(data)
+                test_loss += criterion(output, target).item()  # sum up batch loss
+                pred = output.data.max(1, keepdim=True)[1]  # get the index of the max log-probability
+                correct += pred.eq(target.data.view_as(pred)).sum().item()
+            test_loss /= len(test_loader.dataset)
+            accuracy = 100. * correct / len(test_loader.dataset)
+        return accuracy
+    
+    def prune_by_percentile(self, prune_percent, parameters_to_prune):
+        if args.prune_type == 'local':
+            i = 0
+            for layer, name in parameters_to_prune:
+                i += 1
+                if i != len(parameters_to_prune):
+                    prune.l1_unstructured(layer, name=name, amount=prune_percent)
+                else:
+                    # prune at half ratio for the last output layer
+                    prune.l1_unstructured(layer, name=name, amount=prune_percent/2)
+        elif args.prune_type == 'global':
+            prune.global_unstructured(parameters_to_prune, pruning_method=prune.L1Unstructured, amount=prune_percent)
+
+    def get_mask(self,):
+        step = 0
+        for module, _ in self.parameters_to_prune:
+            self.mask[step] = list(module.named_buffers())[0][1].to(self.device)
+            step += 1 
+    
+    def original_initialization(self, mask_temp, initial_state_dict):
+        step = 0
+        for name, param in self.model.named_parameters(): 
+            if 'conv1' in name:
+                if self.args.prune_conv1:
+                    if "weight" in name: 
+                        param.data = (mask_temp[step] * initial_state_dict[name[:-5]]).to(self.device)
+                        step = step + 1
+                    if "bias" in name:
+                        param.data = initial_state_dict[name]
+            else:
+                if "weight" in name: 
+                    param.data = (mask_temp[step] * initial_state_dict[name[:-5]]).to(self.device)
+                    step = step + 1
+                if "bias" in name:
+                    param.data = initial_state_dict[name]
+        step = 0
+
+    
+def main():
+    torch.cuda.manual_seed_all(args.seed)
+    proposed_prune = LTH(args)
+    proposed_prune.prune()
+
+if __name__ == "__main__":
+    main()
+
+        
+
