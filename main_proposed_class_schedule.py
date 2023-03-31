@@ -25,25 +25,26 @@ import utils
 import random
 import matplotlib.pyplot as plt
 from data import Data
-from archs.cifar10 import AlexNet, LeNet5, fc1, vgg, resnet, densenet 
+from archs.cifar10 import VGG16, AlexNet, LeNet5, fc1, resnet, densenet
+from prune_and_reconnect import Prune_and_Reconnect
+import global_unstructure
 sns.set_style('darkgrid')
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--method", default="proposed_prune_ratio_fixed_experimental_exp_1", help="the proposed method")
+parser.add_argument("--method", default="proposed_prune_ratio_fixed_experimental_exp_4", help="the proposed method")
 parser.add_argument("--lr", default=0.01, type=float, help="Learning rate")
 parser.add_argument("--batch_size", default=60, type=int)
 parser.add_argument("--start_prune_round", default=0, type=int)
-parser.add_argument("--train_epochs", default=200, type=int)
+parser.add_argument("--train_epochs", default=100, type=int)
 parser.add_argument("--print_freq", default=1, type=int)
 parser.add_argument("--valid_freq", default=1, type=int)
 parser.add_argument("--early_stop", default=None, type=int)
 parser.add_argument("--resume", action="store_true")
-parser.add_argument("--prune_type", default="local", type=str, help="local | global")
-parser.add_argument("--device", default="cuda:1", type=str)
+parser.add_argument("--prune_type", default="global", type=str, help="local | global")
+parser.add_argument("--device", default="cuda:0", type=str)
 parser.add_argument("--dataset", default="cifar10", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
 parser.add_argument("--arch_type", default="alexnet", type=str, help="fc1 | advanced_dropout_fc| lenet5 | alexnet | vgg16 | resnet18 | densenet121")
 parser.add_argument("--initial_percent", default=100, type=float, help='percentage of the weights that is trainable and initialized')
-parser.add_argument("--prune_rounds", default=1, type=int, help="Pruning args.prune_roundss count")
 parser.add_argument("--prune_ratio", default=1, type=float, help="Prune ratio during train")
 parser.add_argument("--prune_prob", default=0.01, type=float, help="probability to prune during train")
 parser.add_argument("--target_ratio", default=1.9, type=float, )
@@ -76,7 +77,7 @@ class Proposed_prune():
         elif args.arch_type == "alexnet":
             self.model = AlexNet.AlexNet().to(self.device)
         elif args.arch_type == "vgg16":
-            self.model = vgg.vgg16().to(self.device)  
+            self.model = VGG16.VGG16().to(self.device)  
         elif args.arch_type == "resnet18":
             self.model = resnet.resnet18().to(self.device)   
         elif args.arch_type == "densenet121":
@@ -86,33 +87,33 @@ class Proposed_prune():
             exit()
         self.parameters_to_prune = []
         self.initial_num_weights = []
-        self.target_num_weight = []
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
-                # if name == 'conv1':
-                #     if args.prune_conv1:
-                #         self.parameters_to_prune.append((module, 'weight'))
-                #     else:
-                #         print('skip the first conv2d for L1 unstructure global pruning')
-                # else:
-                self.parameters_to_prune.append((module, 'weight'))
+                if name == 'conv1':
+                    if args.prune_conv1:
+                        self.parameters_to_prune.append((module, 'weight'))
+                    else:
+                        print('skip the first conv2d for L1 unstructure global pruning')
+                else:
+                    self.parameters_to_prune.append((module, 'weight'))
         for name, param in self.model.named_parameters():
             if 'weight' in name:
                 self.initial_num_weights.append(param.numel())
-                if 'fc3' not in name:
-                    self.target_num_weight.append(int(np.rint(param.numel() * args.target_ratio * 0.01)))
-                else:
-                    self.target_num_weight.append(int(np.rint(param.numel() * args.output_target_ratio * 0.01))) # 5% for the output layer
+        self.initial_num_weights = np.array(self.initial_num_weights)
         self.parameters_to_prune = tuple(self.parameters_to_prune)
         self.iter_per_epoch = int(np.ceil(len(train_dataset) / args.batch_size))
         self.total_iter = self.iter_per_epoch * args.train_epochs
-        self.alpha_a = np.log(args.target_ratio*0.01)
-        self.alpha_b = np.log(args.output_target_ratio*0.01)
-        print(self.alpha_a, self.alpha_b)
-        # self.prune_num_iter = (np.array(self.initial_num_weights) - np.array(self.target_num_weight)) / self.total_iter 
-        # print(self.prune_num_iter)
-        # self.total_num_weights = sum(p.numel() for name, p in self.model.named_parameters() if 'weight' in name)
-        # self.target_num_weights = args.target_ratio * self.total_num_weights
+        if args.prune_type == 'local':
+            for layer, name in self.parameters_to_prune:
+                prune.random_unstructured(layer, name=name, amount=1.0-args.initial_percent*0.01)
+                self.alpha_a = np.log(args.target_ratio*0.01)
+                self.alpha_b = np.log(args.output_target_ratio*0.01)
+        elif args.prune_type == 'global':
+            prune.l1_unstructured(self.model.conv1, 'weight', amount=0.)
+            prune.global_unstructured(self.parameters_to_prune, pruning_method=prune.RandomUnstructured, amount=1.0-args.initial_percent*0.01)
+            self.alpha = np.log(args.target_ratio*0.01)
+        else:
+            raise Exception('Invalid prune type.')
         self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/"
         self.plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}/{args.dataset}/"
         utils.checkdir(self.save_path)
@@ -122,12 +123,6 @@ class Proposed_prune():
                 print('%s: %s' %(arg, getattr(args, arg)), file=f) 
     
     def prune(self, ):
-        # plot the histogram of the initial distribution
-        # for name, p in self.model.named_parameters():
-        #     weight_nz = p[torch.nonzero(p, as_tuple=True)]
-        #     plt.hist(weight_nz.cpu().data.view(-1), bins=30)
-        #     plt.savefig(os.path.join(self.plot_path, f"{name}_initial.png"))
-        #     plt.close()
         writer = SummaryWriter(self.save_path)
         criterion = nn.CrossEntropyLoss()
         if args.optimizer == 'adam':
@@ -149,7 +144,7 @@ class Proposed_prune():
         valacc = np.zeros(args.train_epochs,float)
         early_stop_trigger = 0
         # Print the table of Nonzeros in each layer
-        comp1 = utils.print_nonzeros(self.model, writer, 0)
+        comp1 = utils.print_nonzeros(self.model.named_buffers(), writer, 0)
         sparsity = round(100.0-comp1, 1)
         sparsity_[0] = sparsity
         comp[0] = comp1
@@ -179,9 +174,8 @@ class Proposed_prune():
             if args.early_stop is not None and early_stop_trigger > args.early_stop:
                 break
 
-            comp1 = utils.print_nonzeros(self.model, writer, train_epoch)
+            comp1 = utils.print_nonzeros(self.model.named_buffers(), writer, train_epoch)
             sparsity_[train_epoch] = round(100.0-comp1, 1)
-            # best_val_model = torch.load(os.path.join(self.save_path, f"{train_epoch}_model_{args.prune_type}.pt"))
             test_accuracy = self.test(self.model, self.test_loader, criterion)
             print(f'Test Accuracy: {test_accuracy}')
             writer.add_scalar('Accuracy_sparsity/val', best_accuracy, sparsity)
@@ -189,8 +183,9 @@ class Proposed_prune():
             writer.add_scalar('Accuracy_epoch/test', test_accuracy, train_epoch)
             bestacc[0] = best_accuracy
             testacc[train_epoch] = test_accuracy
-            fig_test = utils.plot_sparsity_testacc(sparsity_[:train_epoch+1], testacc[:train_epoch+1], self.plot_path, name='test')
-            fig_val = utils.plot_sparsity_testacc(sparsity_[:train_epoch+1], valacc[:train_epoch+1], self.plot_path, name='val')
+            # if train_epoch > 4:
+            fig_test = utils.plot_sparsity_testacc(sparsity_[4:train_epoch+1], testacc[4:train_epoch+1], self.plot_path, name='test')
+            fig_val = utils.plot_sparsity_testacc(sparsity_[4:train_epoch+1], valacc[4:train_epoch+1], self.plot_path, name='val')
             writer.add_figure('sparsity_testacc', fig_test, train_epoch)
             writer.add_figure('sparsity_valacc', fig_val, train_epoch)
         # for name, p in self.model.named_parameters():
@@ -244,57 +239,60 @@ class Proposed_prune():
     
     def prune_and_reconnect(self, model, prune_prob, prune_ratio, train_iter):
         if random.uniform(0, 1) < prune_prob:
-            prune_count = []
             mask_bef_pru = []
             prune_num_iter = []
             already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
-            for i in range(len(self.parameters_to_prune)):
-                if not self.args.prune_conv1 and i == 0:
-                    prune_num_iter.append(0.)
-                elif i != len(self.parameters_to_prune) - 1:
-                    prune_num_iter.append(self.initial_num_weights[i] * self.exp_pruning_schedule(train_iter, self.alpha_a))
-                else:
-                    prune_num_iter.append(self.initial_num_weights[i] * self.exp_pruning_schedule(train_iter, self.alpha_b))
-            prune_num_iter = np.array(prune_num_iter)
-            to_prune = prune_num_iter - already_pruned 
-            to_prune = np.array([int(np.floor(a)) for a in to_prune])
-            for name, param in model.named_buffers():
-                # prune_count.append(int(np.floor((torch.count_nonzero(param.data)).cpu().numpy() * prune_ratio)))
-                mask_bef_pru.append(param.data)
             # prune the connections
             if args.prune_type == 'local':
-                i = 0
-                for layer, name in self.parameters_to_prune:
-                    # i += 1
-                    # if i != len(self.parameters_to_prune):
-                    if to_prune[i] > 1:
-                        
-                        prune.l1_unstructured(layer, name=name, amount=to_prune[i]*2)
-                    i += 1
-                    # else:
-                    #     # prune at half ratio for the last output layer
-                    #     prune.l1_unstructured(layer, name=name, amount=prune_ratio/2)
-            elif args.prune_type == 'global':
-                prune.global_unstructured(self.parameters_to_prune, pruning_method=prune.L1Unstructured, amount=self.prune_percent)
-            # if prune_count[2] / 2 > 1:
-            # else:
-                # prune.l1_unstructured(model.fc3, name='weight', amount=1)
-            # reconnect the zeroed connections
-            i = 0
-            for module in list(model.children()):
-                mask = mask_bef_pru[i]
-                # if i == 2:
-                #     num_reconnect = to_prune[i] // 4 
-                # else:
-                if to_prune[i] > 1:
-                    num_reconnect = to_prune[i] # add less connection than prune
-                    zero_indices = (mask.view(-1) == 0).nonzero()
-                #     # shuffle it
-                    idx = torch.randperm(zero_indices.nelement())
-                    zero_indices = zero_indices.view(-1)[idx].view(zero_indices.size())[0:num_reconnect]
+                prune_ratio_a = self.exp_pruning_schedule(train_iter, self.alpha_a)
+                prune_ratio_b = self.exp_pruning_schedule(train_iter, self.alpha_b)
             
-                    (list(module.named_buffers())[0][1]).view(-1)[zero_indices] = 1.
+                for i in range(len(self.parameters_to_prune)):
+                    if not self.args.prune_conv1:
+                        if i == 0:
+                            prune_num_iter.append(0.)
+                        elif i != len(self.parameters_to_prune) - 1:
+                            prune_num_iter.append(self.initial_num_weights[i] * prune_ratio_a)
+                        else:
+                            prune_num_iter.append(self.initial_num_weights[i] * prune_ratio_b)
+                    else: 
+                        if i != len(self.parameters_to_prune) - 1:
+                            prune_num_iter.append(self.initial_num_weights[i] * prune_ratio_a)
+                        else:
+                            prune_num_iter.append(self.initial_num_weights[i] * prune_ratio_b)
+                prune_num_iter = np.array(prune_num_iter)
+                to_prune = prune_num_iter - already_pruned 
+                to_prune = np.array([int(np.floor(a)) for a in to_prune])
+                for name, param in model.named_buffers():
+                    mask_bef_pru.append(param.data)
+                    i = 0
+                    for layer, name in self.parameters_to_prune:
+                        if to_prune[i] >= 1:
+                            prune.l1_unstructured(layer, name=name, amount=to_prune[i]*2)
+                            # prune.remove(layer, name=name)
+                        i += 1
+                            # reconnect the zeroed connections
+                i = 0
+                for module in list(model.children()):
+                    mask = mask_bef_pru[i]
+                    if to_prune[i] >= 1:
+                        num_reconnect = to_prune[i] # add less connection than prune
+                        zero_indices = (mask.view(-1) == 0).nonzero()
+                    #     # shuffle it
+                        idx = torch.randperm(zero_indices.nelement())
+                        zero_indices = zero_indices.view(-1)[idx].view(zero_indices.size())[0:num_reconnect]
+                        
+                        (list(module.named_buffers())[0][1]).view(-1)[zero_indices] = 1.
                     i += 1
+            elif args.prune_type == 'global':
+                prune_ratio = self.exp_pruning_schedule(train_iter, self.alpha)
+                # print(prune_ratio)
+                to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
+                # print(to_prune, self.initial_num_weights.sum()*prune_ratio, already_pruned.sum())
+                global_unstructure.global_unstructured(self.parameters_to_prune, pruning_method=Prune_and_Reconnect, amount=to_prune)
+                # prune.global_unstructured(self.parameters_to_prune, pruning_method=Reconnect, amount=to_prune*2)
+                # for module, name in self.parameters_to_prune:
+                #     prune.remove(module, name)
     
     def exp_pruning_schedule(self, cur_iter, alpha):
         return 1. - np.exp(alpha * cur_iter / self.total_iter)
