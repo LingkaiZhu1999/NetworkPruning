@@ -9,13 +9,13 @@ import io
 import utils
 
 #ANCHOR Print table of zeros and non-zeros count
-def print_nonzeros(model, writer, _ite):
+def print_nonzeros(model_info, writer, _ite):
     nonzero = total = 0
     info_ = ''
-    if list(model.named_buffers()) != []:
-        model_info = model.named_buffers()
-    else:
-        model_info = model.named_parameters()   
+    # if list(model.named_buffers()) != []:
+    #     model_info = model.named_buffers()
+    # else:
+    # model_info = model.named_parameters()   
     for name, p in model_info:
         tensor = p.data
         nz_count = torch.count_nonzero(tensor).cpu().numpy()
@@ -44,15 +44,15 @@ def original_initialization(mask_temp, initial_state_dict):
             param.data = initial_state_dict[name]
     step = 0
 
-def plot_sparsity_testacc(sparsity, testacc, plot_path):
+def plot_sparsity_testacc(sparsity, testacc, plot_path, name='test'):
     fig = plt.figure()
-    plt.plot(sparsity, testacc)
+    plt.plot(sparsity, testacc, 'o-')
     plt.xlabel('Sparsity')
     # plt.xticks(sparsity)
     # plt.set_
     plt.ylabel('Test accuracy')
     # plt.ylim([70,100])
-    plt.savefig(os.path.join(plot_path, "acc_vs_sparsity.png"), dpi=1200)
+    plt.savefig(os.path.join(plot_path, f"acc_vs_sparsity_{name}.png"), dpi=1200)
     plt.close()
     return fig
 
