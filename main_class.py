@@ -25,24 +25,26 @@ import utils
 import random
 import matplotlib.pyplot as plt
 from data import Data
-from archs.cifar10 import AlexNet, LeNet5, fc1, resnet 
+import pandas as pd
+from global_unstructure import global_unstructured
+from archs.cifar10 import AlexNet, LeNet5, fc1, resnet, vgg
 
 sns.set_style('darkgrid')
 parser = argparse.ArgumentParser()
 parser.add_argument("--method", default="LTH", help="name of the method, it is Lottery Ticket Hypothesis")
 parser.add_argument("--lr",default=0.01, type=float, help="Learning rate") # learning rate have a big effect
-parser.add_argument("--batch_size", default=60, type=int)
+parser.add_argument("--batch_size", default=64, type=int)
 parser.add_argument("--start_prune_prune_round", default=0, type=int)
-parser.add_argument("--train_epochs", default=1, type=int)
+parser.add_argument("--train_epochs", default=160, type=int)
 parser.add_argument("--print_freq", default=1, type=int)
 parser.add_argument("--valid_freq", default=1, type=int)
-parser.add_argument("--early_stop", default=15, type=int)
+parser.add_argument("--early_stop", default=None, type=int)
 parser.add_argument("--resume", action="store_true")
 parser.add_argument("--retrain_type", default="original", type=str, help="original | reinit")
 parser.add_argument("--prune_type", default="global", help="local | global")
 parser.add_argument("--device", default="cuda:0", type=str)
 parser.add_argument("--dataset", default="cifar10", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
-parser.add_argument("--arch_type", default="alexnet", type=str, help="fc1 | advanced_dropout_fc | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
+parser.add_argument("--arch_type", default="vgg16", type=str, help="fc1 | advanced_dropout_fc | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
 parser.add_argument("--prune_percent", default=20, type=int, help="Pruning percent")
 parser.add_argument("--prune_rounds", default=20, type=int, help="Pruning args.prune_roundss count")
 parser.add_argument("--prune_conv1", default=False)
@@ -61,8 +63,19 @@ class LTH():
             self.model = LeNet5.LeNet5().to(self.device)
         elif args.arch_type == "alexnet":
             self.model = AlexNet.AlexNet().to(self.device)
+            args.lr = 0.01
+            args.weight_decay = 0.0005
+            args.momentum = 0.9
         elif args.arch_type == "vgg16":
-            self.model = VGG16.VGG16().to(self.device)  
+            self.model = vgg.vgg16_bn(num_classes=10).to(self.device)
+            args.lr = 0.1
+            args.weight_decay = 0.0001
+            args.momentum = 0.9
+        elif args.arch_type == "vgg19":
+            self.model = vgg.vgg19_bn(num_classes=10).to(self.device)
+            args.lr = 0.1
+            args.weight_decay = 0.0001
+            args.momentum = 0.9
         elif args.arch_type == "resnet18":
             self.model = resnet.resnet18().to(self.device)   
             args.lr = 0.1
@@ -153,7 +166,7 @@ class LTH():
                     raise Exception('wrong optimizer, has to be adam or sgd')
             print(f"\n--- Pruning Level [{prune_round}/{self.args.prune_rounds}]: ---")
             # Print the table of Nonzeros in each layer
-            comp1 = utils.print_nonzeros(self.model.named_parameters(), writer, prune_round)
+            comp1 = utils.print_nonzeros_lth(self.model.named_modules(), writer, prune_round)
             sparsity = round(float(100.0 - comp1), 1)
             sparsity_[prune_round] = sparsity
             comp[prune_round] = comp1
@@ -174,14 +187,18 @@ class LTH():
                         early_stop_trigger += 1
 
                 # Training
+                if 'vgg' in self.args.arch_type:
+                    if iter_ + 1 == 10 or iter_ + 1 == 80 or iter_ + 1 == 120:
+                        for g in optimizer.param_groups:
+                            g['lr'] /= 10
                 loss = self.train(self.model, self.train_loader, optimizer, criterion)
                 all_loss[iter_] = loss
                 all_accuracy[iter_] = val_accuracy
                 # Frequency for Printing Accuracy and Loss
                 if iter_ % self.args.print_freq == 0:
                     pbar.set_description(
-                        f'Train Epoch: {iter_}/{self.args.train_epochs} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
-                if early_stop_trigger > self.args.early_stop:
+                        f'Train Epoch: {iter_}/{self.args.train_epochs} LR: {optimizer.param_groups[-1]["lr"]} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
+                if self.args.early_stop is not None and early_stop_trigger > self.args.early_stop:
                     break
 
             best_val_model = torch.load(os.path.join(self.save_path, f"{prune_round}_model_{self.args.retrain_type}.pt"))
@@ -193,6 +210,12 @@ class LTH():
             bestacc[prune_round] = best_accuracy
             testacc[prune_round] = test_accuracy
             fig = utils.plot_sparsity_testacc(sparsity_[:prune_round+1], testacc[:prune_round+1], self.plot_path)
+            fig = utils.plot_sparsity_testacc(sparsity_[:prune_round+1], bestacc[:prune_round+1], self.plot_path, name='val')
+            # save to csv
+            d = {'sparsity': sparsity_[: prune_round+1], 'testacc': testacc[:prune_round+1]}
+            df = pd.DataFrame(data=d)
+            df.to_csv(f"{self.save_path}/sparsity_vs_testacc.csv")
+
             writer.add_figure('sparsity_testacc', fig, prune_round)
             
             # Making variables into 0
@@ -254,31 +277,53 @@ class LTH():
                     # prune at half ratio for the last output layer
                     prune.l1_unstructured(layer, name=name, amount=prune_percent/2)
         elif args.prune_type == 'global':
-            prune.global_unstructured(parameters_to_prune, pruning_method=prune.L1Unstructured, amount=prune_percent)
+            global_unstructured(parameters_to_prune, pruning_method=prune.L1Unstructured, amount=prune_percent)
 
     def get_mask(self,):
         step = 0
         for module, _ in self.parameters_to_prune:
-            self.mask[step] = list(module.named_buffers())[0][1].to(self.device)
+            self.mask[step] = list(module.named_buffers())[0][1].to(self.device).to_sparse()
             step += 1 
     
     def original_initialization(self, mask_temp, initial_state_dict):
-        step = 0
-        for name, param in self.model.named_parameters(): 
-            if 'conv1' in name:
-                if self.args.prune_conv1:
-                    if "weight" in name: 
-                        param.data = (mask_temp[step] * initial_state_dict[name[:-5]]).to(self.device)
-                        step = step + 1
-                    if "bias" in name:
-                        param.data = initial_state_dict[name]
-            else:
-                if "weight" in name: 
-                    param.data = (mask_temp[step] * initial_state_dict[name[:-5]]).to(self.device)
-                    step = step + 1
-                if "bias" in name:
-                    param.data = initial_state_dict[name]
-        step = 0
+        if args.arch_type == "fc1":
+            ini_model = fc1.fc1().to(self.device)
+        elif args.arch_type == "lenet5":
+            ini_model = LeNet5.LeNet5().to(self.device)
+        elif args.arch_type == "alexnet":
+            ini_model = AlexNet.AlexNet().to(self.device)
+        elif args.arch_type == "vgg16":
+            ini_model = vgg.vgg16_bn(num_classes=10).to(self.device)
+        elif args.arch_type == "vgg19":
+            ini_model = vgg.vgg19_bn(num_classes=10).to(self.device)
+        elif args.arch_type == "resnet18":
+            ini_model = resnet.resnet18().to(self.device)   
+        elif args.arch_type == "densenet121":
+            ini_model = densenet.densenet121().to(self.device)   
+        # If you want to add extra model paste here
+        else:
+            print("\nWrong Model choice\n")
+            exit()
+        ini_model.load_state_dict(initial_state_dict)
+        # step = 0
+        for module, ini_module in zip(self.model.modules(), ini_model.modules()): 
+            if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                module.weight.data = (module.weight.data != 0).float() * ini_module.weight.data
+                # print(torch.count_nonzero(module.weight.data == 0).int())
+            # if 'conv1' in name:
+            #     if self.args.prune_conv1:
+            #         if "weight" in name: 
+            #             param.data = (mask_temp[step] * initial_state_dict[name[:-5]]).to(self.device).to_dense()
+            #             step = step + 1
+            #         if "bias" in name:
+            #             param.data = initial_state_dict[name]
+            # else:
+            #     if "weight" in name: 
+            #         param.data = (mask_temp[step] * initial_state_dict[name[:-5]]).to(self.device).to_dense()
+            #         step = step + 1
+            #     if "bias" in name:
+            #         param.data = initial_state_dict[name]
+        # step = 0
 
     
 def main():
