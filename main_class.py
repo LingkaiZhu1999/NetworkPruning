@@ -28,7 +28,7 @@ from data import Data
 import pandas as pd
 from global_unstructure import global_unstructured
 from archs.cifar10 import AlexNet, LeNet5, fc1, resnet, vgg
-
+from ptflops import get_model_complexity_info
 sns.set_style('darkgrid')
 parser = argparse.ArgumentParser()
 parser.add_argument("--method", default="LTH", help="name of the method, it is Lottery Ticket Hypothesis")
@@ -100,14 +100,13 @@ class LTH():
         self.parameters_to_prune = []
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
-                if name == 'conv1':
+                if name == 'conv1' or name == 'features.0':
                     if args.prune_conv1:
                         self.parameters_to_prune.append((module, 'weight'))
                 else:
                     self.parameters_to_prune.append((module, 'weight'))
             
         self.parameters_to_prune = tuple(self.parameters_to_prune)
-
         self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}/{args.dataset}/"
         self.plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}/{args.dataset}/"
         utils.checkdir(self.save_path)
@@ -119,6 +118,9 @@ class LTH():
         self.mask = [None] * len(self.parameters_to_prune)
         self.initial_state_dict = copy.deepcopy(self.model.state_dict())
         torch.save(self.model, os.path.join(self.save_path, "initial_state_dict_{args.retrain_type}.pt"))
+        
+        self.iter_per_epoch = int(np.ceil(len(train_dataset) / args.batch_size))
+        self.total_iter = self.iter_per_epoch * self.train_epochs 
 
     def prune(self, ):
         bestacc = 0.0
@@ -127,6 +129,8 @@ class LTH():
         bestacc = np.zeros(self.args.prune_rounds,float)
         testacc = np.zeros(self.args.prune_rounds, float)
         sparsity_ = np.zeros(self.args.prune_rounds, float)
+        flops_ = np.zeros(self.args.prune_rounds, float)
+        flops = 0
         step = 0
         all_loss = np.zeros(self.args.train_epochs,float)
         all_accuracy = np.zeros(self.args.train_epochs,float)
@@ -143,6 +147,11 @@ class LTH():
         criterion = nn.CrossEntropyLoss()
         
         for prune_round in range(self.args.start_prune_prune_round, self.args.prune_rounds):
+            imgs, _ = next(iter(self.train_loader))
+            flops_temp, _ = get_model_complexity_info(self.model, tuple(imgs.shape), as_strings=False, print_per_layer_stat=False, verbose=False)
+            flops += flops_temp * self.total_iter 
+            flops_[prune_round] = flops
+            del self.model.__dict__["start_flops_count"], self.model.__dict__["stop_flops_count"], self.model.__dict__["reset_flops_count"], self.model.__dict__["compute_average_flops_cost"]
             
             if not prune_round == 0: # don't prune for the first running prune_round, because we want the model to be well trained before we prune it.
                 print(prune_round)
@@ -197,7 +206,7 @@ class LTH():
                 # Frequency for Printing Accuracy and Loss
                 if iter_ % self.args.print_freq == 0:
                     pbar.set_description(
-                        f'Train Epoch: {iter_}/{self.args.train_epochs} LR: {optimizer.param_groups[-1]["lr"]} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
+                        f'Train Epoch: {iter_}/{self.args.train_epochs} LR: {optimizer.param_groups[-1]["lr"]} FLOPs: {flops} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
                 if self.args.early_stop is not None and early_stop_trigger > self.args.early_stop:
                     break
 
@@ -212,7 +221,7 @@ class LTH():
             fig = utils.plot_sparsity_testacc(sparsity_[:prune_round+1], testacc[:prune_round+1], self.plot_path)
             fig = utils.plot_sparsity_testacc(sparsity_[:prune_round+1], bestacc[:prune_round+1], self.plot_path, name='val')
             # save to csv
-            d = {'sparsity': sparsity_[: prune_round+1], 'testacc': testacc[:prune_round+1]}
+            d = {'sparsity': sparsity_[: prune_round+1], 'testacc': testacc[:prune_round+1], 'flops': flops_[:prune_round+1]}
             df = pd.DataFrame(data=d)
             df.to_csv(f"{self.save_path}/sparsity_vs_testacc.csv")
 
