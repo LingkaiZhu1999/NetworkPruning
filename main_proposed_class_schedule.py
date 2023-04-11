@@ -25,29 +25,35 @@ import utils
 import random
 import matplotlib.pyplot as plt
 from data import Data
-from archs.cifar10 import VGG16, AlexNet, LeNet5, fc1, resnet, densenet
+from archs.cifar10 import VGG16, AlexNet, LeNet5, fc1, resnet, densenet, vgg
 from prune_and_reconnect import Prune_and_Reconnect
 import global_unstructure
+import pandas as pd
+from fvcore.nn import FlopCountAnalysis
+from ptflops import get_model_complexity_info
+from ptflops import pytorch_ops
+import copy
+# from torchstat import stat
 sns.set_style('darkgrid')
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--method", default="proposed_prune_ratio_fixed_experimental_exp_4", help="the proposed method")
+parser.add_argument("--method", default="proposed_prune_ratio_fixed_experimental_exp_7_fine_tune", help="the proposed method")
 parser.add_argument("--lr", default=0.01, type=float, help="Learning rate")
 parser.add_argument("--batch_size", default=60, type=int)
 parser.add_argument("--start_prune_round", default=0, type=int)
-parser.add_argument("--train_epochs", default=100, type=int)
+parser.add_argument("--train_epochs", default=160, type=int)
 parser.add_argument("--print_freq", default=1, type=int)
 parser.add_argument("--valid_freq", default=1, type=int)
 parser.add_argument("--early_stop", default=None, type=int)
 parser.add_argument("--resume", action="store_true")
 parser.add_argument("--prune_type", default="global", type=str, help="local | global")
-parser.add_argument("--device", default="cuda:0", type=str)
+parser.add_argument("--device", default="cuda:1", type=str)
 parser.add_argument("--dataset", default="cifar10", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
-parser.add_argument("--arch_type", default="alexnet", type=str, help="fc1 | advanced_dropout_fc| lenet5 | alexnet | vgg16 | resnet18 | densenet121")
+parser.add_argument("--arch_type", default="vgg16", type=str, help="fc1 | advanced_dropout_fc| lenet5 | alexnet | vgg16 | resnet18 | densenet121")
 parser.add_argument("--initial_percent", default=100, type=float, help='percentage of the weights that is trainable and initialized')
 parser.add_argument("--prune_ratio", default=1, type=float, help="Prune ratio during train")
 parser.add_argument("--prune_prob", default=0.01, type=float, help="probability to prune during train")
-parser.add_argument("--target_ratio", default=1.9, type=float, )
+parser.add_argument("--target_ratio", default=1.5, type=float, )
 parser.add_argument("--prune_conv1", default=False)
 parser.add_argument("--output_target_ratio", default=5, type=float)
 parser.add_argument("--optimizer", default="sgd", help="adam | sgd")
@@ -76,12 +82,22 @@ class Proposed_prune():
             self.model = LeNet5.LeNet5().to(self.device)
         elif args.arch_type == "alexnet":
             self.model = AlexNet.AlexNet().to(self.device)
+            args.lr = 0.01
+            args.weight_decay = 0.0005
+            args.momentum = 0.9
         elif args.arch_type == "vgg16":
-            self.model = VGG16.VGG16().to(self.device)  
+            self.model = vgg.vgg16_bn(num_classes=10).to(self.device)
+            args.lr = 0.1
+            args.weight_decay = 0.0001
+            args.momentum = 0.9
         elif args.arch_type == "resnet18":
             self.model = resnet.resnet18().to(self.device)   
+            args.lr = 0.1
+            args.weight_decay = 0.0001
+            args.momentum = 0.9
         elif args.arch_type == "densenet121":
             self.model = densenet.densenet121().to(self.device)   
+        # If you want to add extra model paste here
         else:
             print("\nWrong Model choice\n")
             exit()
@@ -89,7 +105,7 @@ class Proposed_prune():
         self.initial_num_weights = []
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
-                if name == 'conv1':
+                if name == 'conv1' or name == 'features.0':
                     if args.prune_conv1:
                         self.parameters_to_prune.append((module, 'weight'))
                     else:
@@ -109,7 +125,10 @@ class Proposed_prune():
                 self.alpha_a = np.log(args.target_ratio*0.01)
                 self.alpha_b = np.log(args.output_target_ratio*0.01)
         elif args.prune_type == 'global':
-            prune.l1_unstructured(self.model.conv1, 'weight', amount=0.)
+            try: 
+                prune.random_unstructured(self.model.conv1, 'weight', amount=0.)
+            except:
+                prune.random_unstructured(self.model.features[0], 'weight', amount=0.)
             prune.global_unstructured(self.parameters_to_prune, pruning_method=prune.RandomUnstructured, amount=1.0-args.initial_percent*0.01)
             self.alpha = np.log(args.target_ratio*0.01)
         else:
@@ -139,17 +158,18 @@ class Proposed_prune():
         bestacc = np.zeros(args.train_epochs,float)
         testacc = np.zeros(args.train_epochs, float)
         sparsity_ = np.zeros(args.train_epochs, float)
+        flops_ = np.zeros(args.train_epochs, float)
         step = 0
         all_loss = np.zeros(args.train_epochs,float)
         valacc = np.zeros(args.train_epochs,float)
         early_stop_trigger = 0
         # Print the table of Nonzeros in each layer
-        comp1 = utils.print_nonzeros(self.model.named_buffers(), writer, 0)
+        comp1 = utils.print_nonzeros_lth(self.model.named_modules(), writer, 0)
         sparsity = round(100.0-comp1, 1)
         sparsity_[0] = sparsity
         comp[0] = comp1
         pbar = tqdm(range(args.train_epochs))
-
+        flops_total = 0
         for train_epoch in pbar:
             # Frequency for Testing
             if train_epoch % args.valid_freq == 0:
@@ -162,19 +182,25 @@ class Proposed_prune():
                 else:
                     early_stop_trigger += 1
             
+            if 'vgg' in self.args.arch_type:
+                if train_epoch + 1 == 10 or train_epoch + 1 == 80 or train_epoch + 1 == 120:
+                    for g in optimizer.param_groups:
+                        g['lr'] /= 10
             # Training
-            loss = self.train(self.model, self.train_loader, optimizer, criterion, train_epoch, self.args)
+            loss, flops_epoch = self.train(self.model, self.train_loader, optimizer, criterion, train_epoch, self.args)
+            flops_total += flops_epoch
+            flops_[train_epoch] = flops_total
             torch.save(self.model, os.path.join(self.save_path, f"{train_epoch}_model_{args.prune_type}.pt"))
             all_loss[train_epoch] = loss
             valacc[train_epoch] = val_accuracy
             # Frequency for Printing Accuracy and Loss
             if train_epoch % args.print_freq == 0:
                 pbar.set_description(
-                    f'Train Epoch: {train_epoch}/{args.train_epochs} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
+                    f'Train Epoch: {train_epoch}/{args.train_epochs} LR: {optimizer.param_groups[-1]["lr"]} FLOPs: {flops_epoch} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
             if args.early_stop is not None and early_stop_trigger > args.early_stop:
                 break
 
-            comp1 = utils.print_nonzeros(self.model.named_buffers(), writer, train_epoch)
+            comp1 = utils.print_nonzeros_lth(self.model.named_modules(), writer, train_epoch)
             sparsity_[train_epoch] = round(100.0-comp1, 1)
             test_accuracy = self.test(self.model, self.test_loader, criterion)
             print(f'Test Accuracy: {test_accuracy}')
@@ -184,10 +210,14 @@ class Proposed_prune():
             bestacc[0] = best_accuracy
             testacc[train_epoch] = test_accuracy
             # if train_epoch > 4:
-            fig_test = utils.plot_sparsity_testacc(sparsity_[4:train_epoch+1], testacc[4:train_epoch+1], self.plot_path, name='test')
-            fig_val = utils.plot_sparsity_testacc(sparsity_[4:train_epoch+1], valacc[4:train_epoch+1], self.plot_path, name='val')
+            fig_test = utils.plot_sparsity_testacc(sparsity_[10:train_epoch+1], testacc[10:train_epoch+1], self.plot_path, name='test')
+            fig_val = utils.plot_sparsity_testacc(sparsity_[10:train_epoch+1], valacc[10:train_epoch+1], self.plot_path, name='val')
             writer.add_figure('sparsity_testacc', fig_test, train_epoch)
             writer.add_figure('sparsity_valacc', fig_val, train_epoch)
+            d = {'sparsity': sparsity_[: train_epoch+1], 'testacc': testacc[:train_epoch+1], 'flops': flops_[:train_epoch+1]}
+            df = pd.DataFrame(data=d)
+            df.to_csv(f"{self.save_path}/sparsity_vs_testacc.csv")
+
         # for name, p in self.model.named_parameters():
         #     weight_nz = p[torch.nonzero(p, as_tuple=True)]
         #     plt.hist(weight_nz.cpu().data.view(-1), bins=30)
@@ -200,12 +230,16 @@ class Proposed_prune():
         metric = MeanMetric()
         EPS = 1e-6
         model.train()
+        flops = 0
         for batch_idx, (imgs, targets) in enumerate(train_loader):
             train_iter = train_epoch * self.iter_per_epoch + batch_idx
             optimizer.zero_grad()
             #imgs, targets = next(train_loader)
             imgs, targets = imgs.to(self.device), targets.to(self.device)
             output = model(imgs)
+            b, c, h, w = imgs.shape
+            flops_temp, _ = get_model_complexity_info(self.model, (b, c, h, w), as_strings=False, print_per_layer_stat=False, verbose=False)
+            flops += flops_temp
             train_loss = criterion(output, targets)
             train_loss.backward()
             metric.update(train_loss.detach().cpu())
@@ -219,8 +253,7 @@ class Proposed_prune():
 
             optimizer.step()
             self.prune_and_reconnect(model, args.prune_prob, args.prune_ratio * 0.01, train_iter)
-        
-        return metric.compute().item()
+        return metric.compute().item(), flops
 
     def test(self, model, test_loader, criterion):
         model.eval()
