@@ -56,7 +56,7 @@ class Prune_and_Reconnect(BasePruningMethod):
         return mask
 
     @classmethod
-    def apply(cls, module, name, amount, importance_scores=None):
+    def apply(cls, module, name, amount_prune, amount_add, importance_scores=None):
         r"""Adds the forward pre-hook that enables pruning on the fly and
         the reparametrization of a tensor in terms of the original tensor
         and the pruning mask.
@@ -76,9 +76,12 @@ class Prune_and_Reconnect(BasePruningMethod):
                 If unspecified or None, the module parameter will be used in its place.
         """
         return super(Prune_and_Reconnect, cls).apply(
-            module, name, amount=amount, importance_scores=importance_scores
+            module, name, amount_prune=amount_prune, amount_add=amount_add, importance_scores=importance_scores
         )
     
+def prune_and_connect(module, name, amount_prune, amount_add, importance_scores=None):
+    Prune_and_Reconnect.apply(module, name, amount_add=amount_add, amount_prune=amount_prune, importance_scores=importance_scores)
+    return module
 class Prune_L1(BasePruningMethod):
     r"""Reconnect (currently unpruned) units in a tensor by assiging one to the mask of the ones
     with the lowest L1-norm.

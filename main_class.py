@@ -27,8 +27,8 @@ import matplotlib.pyplot as plt
 from data import Data
 import pandas as pd
 from global_unstructure import global_unstructured
-from archs.cifar10 import AlexNet, LeNet5, fc1, resnet, vgg
-from ptflops import get_model_complexity_info
+from archs.cifar10 import AlexNet, LeNet5, fc1, resnet, vgg, wide_resnet
+# from ptflops import get_model_complexity_info
 sns.set_style('darkgrid')
 parser = argparse.ArgumentParser()
 parser.add_argument("--method", default="LTH", help="name of the method, it is Lottery Ticket Hypothesis")
@@ -44,13 +44,14 @@ parser.add_argument("--retrain_type", default="original", type=str, help="origin
 parser.add_argument("--prune_type", default="global", help="local | global")
 parser.add_argument("--device", default="cuda:0", type=str)
 parser.add_argument("--dataset", default="cifar10", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
-parser.add_argument("--arch_type", default="vgg16", type=str, help="fc1 | advanced_dropout_fc | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
+parser.add_argument("--arch_type", default="wideresnet", type=str, help="fc1 | advanced_dropout_fc | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
 parser.add_argument("--prune_percent", default=20, type=int, help="Pruning percent")
 parser.add_argument("--prune_rounds", default=20, type=int, help="Pruning args.prune_roundss count")
 parser.add_argument("--prune_conv1", default=False)
 parser.add_argument("--optimizer", default="sgd", help="adam | sgd")
 parser.add_argument("--momentum", default=0.9, type=float)
 parser.add_argument("--weight_decay", default=0.0005, type=float, help="weight decay for adam optim")
+parser.add_argument("--val_set", default=False, help="whether have a val set")
 parser.add_argument("--seed", default=1, type=int)
 args = parser.parse_args()
 
@@ -76,10 +77,18 @@ class LTH():
             args.lr = 0.1
             args.weight_decay = 0.0001
             args.momentum = 0.9
-        elif args.arch_type == "resnet18":
-            self.model = resnet.resnet18().to(self.device)   
+        elif args.arch_type == "resnet50":
+            self.model = resnet.ResNet50().to(self.device)
             args.lr = 0.1
             args.weight_decay = 0.0001
+            args.momentum = 0.9
+            # args.train_epochs = 160
+        elif "wideresnet" in args.arch_type:
+            self.model = wide_resnet.Wide_ResNet(depth=22, widen_factor=2, dropout_rate=0.3, num_classes=10).to(self.device)
+            args.weight_decay = 5e-4
+            args.lr = 0.1
+            args.train_epochs = 240
+            args.batch_size = 128
             args.momentum = 0.9
         elif args.arch_type == "densenet121":
             self.model = densenet.densenet121().to(self.device)   
@@ -91,11 +100,15 @@ class LTH():
         self.train_epochs = args.train_epochs
         self.args = args
         data = Data(args.seed)
-        train_dataset, val_dataset, testdataset = data.get_dataset(dataset=args.dataset)
-        self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
-        self.val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
-        #train_loader = cycle(train_loader)
-        self.test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=4,drop_last=True)
+        if args.val_set:
+            train_dataset, val_dataset, testdataset = data.get_dataset(dataset=args.dataset, val=args.val_set)
+            self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
+            self.val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
+            self.test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=4,drop_last=False)
+        else:
+            train_dataset, testdataset = data.get_dataset(dataset=args.dataset, val=args.val_set)
+            self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
+            self.test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=4,drop_last=False)
         
         self.parameters_to_prune = []
         for name, module in self.model.named_modules():
@@ -107,8 +120,8 @@ class LTH():
                     self.parameters_to_prune.append((module, 'weight'))
             
         self.parameters_to_prune = tuple(self.parameters_to_prune)
-        self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}/{args.dataset}/"
-        self.plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}/{args.dataset}/"
+        self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_{args.prune_type}/{args.dataset}/"
+        self.plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_{args.prune_type}/{args.dataset}/"
         utils.checkdir(self.save_path)
         utils.checkdir(self.plot_path)
         with open(os.path.join(self.save_path, "args.txt"), 'w') as f:
@@ -121,7 +134,7 @@ class LTH():
         
         self.iter_per_epoch = int(np.ceil(len(train_dataset) / args.batch_size))
         self.total_iter = self.iter_per_epoch * self.train_epochs 
-
+        
     def prune(self, ):
         bestacc = 0.0
         best_accuracy = 0
@@ -147,11 +160,11 @@ class LTH():
         criterion = nn.CrossEntropyLoss()
         
         for prune_round in range(self.args.start_prune_prune_round, self.args.prune_rounds):
-            imgs, _ = next(iter(self.train_loader))
-            flops_temp, _ = get_model_complexity_info(self.model, tuple(imgs.shape), as_strings=False, print_per_layer_stat=False, verbose=False)
-            flops += flops_temp * self.total_iter 
-            flops_[prune_round] = flops
-            del self.model.__dict__["start_flops_count"], self.model.__dict__["stop_flops_count"], self.model.__dict__["reset_flops_count"], self.model.__dict__["compute_average_flops_cost"]
+            # imgs, _ = next(iter(self.train_loader))
+            # flops_temp, _ = get_model_complexity_info(self.model, tuple(imgs.shape), as_strings=False, print_per_layer_stat=False, verbose=False)
+            # flops += flops_temp * self.total_iter 
+            # flops_[prune_round] = flops
+            # del self.model.__dict__["start_flops_count"], self.model.__dict__["stop_flops_count"], self.model.__dict__["reset_flops_count"], self.model.__dict__["compute_average_flops_cost"]
             
             if not prune_round == 0: # don't prune for the first running prune_round, because we want the model to be well trained before we prune it.
                 print(prune_round)
@@ -181,12 +194,12 @@ class LTH():
             comp[prune_round] = comp1
             pbar = tqdm(range(self.args.train_epochs))
 
-            for iter_ in pbar:
+            for train_epoch in pbar:
 
                 # Frequency for Testing
-                if iter_ % self.args.valid_freq == 0:
+                if train_epoch % self.args.valid_freq == 0 and self.args.val_set:
                     val_accuracy = self.test(self.model, self.val_loader, criterion)
-                    writer.add_scalar(f'{prune_round}/valacc', val_accuracy, iter_)
+                    writer.add_scalar(f'{prune_round}/valacc', val_accuracy, train_epoch)
                     # Save Weights
                     if val_accuracy > best_accuracy:
                         best_accuracy = val_accuracy
@@ -194,25 +207,31 @@ class LTH():
                         early_stop_trigger = 0
                     else:
                         early_stop_trigger += 1
+                    all_accuracy[train_epoch] = val_accuracy
 
                 # Training
-                if 'vgg' in self.args.arch_type:
-                    if iter_ + 1 == 10 or iter_ + 1 == 80 or iter_ + 1 == 120:
+                if 'vgg' or 'resnet' in self.args.arch_type:
+                    if train_epoch + 1 == 10 or train_epoch + 1 == 80 or train_epoch + 1 == 120:
                         for g in optimizer.param_groups:
                             g['lr'] /= 10
-                loss = self.train(self.model, self.train_loader, optimizer, criterion)
-                all_loss[iter_] = loss
-                all_accuracy[iter_] = val_accuracy
+                # if 'resnet' in self.args.arch_type:
+                #     if iter_ + 1 % 30 == 0:
+                #         for g in optimizer.param_groups:
+                #             g['lr'] /= 10
+                loss = self.train(self.model, self.train_loader, optimizer, criterion, train_epoch)
+                all_loss[train_epoch] = loss
                 # Frequency for Printing Accuracy and Loss
-                if iter_ % self.args.print_freq == 0:
+                if train_epoch % self.args.print_freq == 0:
                     pbar.set_description(
-                        f'Train Epoch: {iter_}/{self.args.train_epochs} LR: {optimizer.param_groups[-1]["lr"]} FLOPs: {flops} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
+                        f'Train Epoch: {train_epoch}/{self.args.train_epochs} LR: {optimizer.param_groups[-1]["lr"]} FLOPs: {flops} Loss: {loss:.6f}')       
                 if self.args.early_stop is not None and early_stop_trigger > self.args.early_stop:
                     break
-
-            best_val_model = torch.load(os.path.join(self.save_path, f"{prune_round}_model_{self.args.retrain_type}.pt"))
-            test_accuracy = self.test(best_val_model, self.test_loader, criterion)
-            del best_val_model
+            if self.args.val_set:
+                best_val_model = torch.load(os.path.join(self.save_path, f"{prune_round}_model_{self.args.retrain_type}.pt"))
+                test_accuracy = self.test(best_val_model, self.test_loader, criterion)
+                del best_val_model
+            else:
+                test_accuracy = self.test(self.model, self.test_loader, criterion)
             print(f'Test Accuracy: {test_accuracy}')
             writer.add_scalar('Accuracy/val', best_accuracy, sparsity)
             writer.add_scalar('Accuracy/test', test_accuracy, sparsity)
@@ -236,11 +255,16 @@ class LTH():
 
 
 
-    def train(self, model, train_loader, optimizer, criterion):
+    def train(self, model, train_loader, optimizer, criterion, train_epoch):
         metric = MeanMetric()
         EPS = 1e-6
         model.train()
         for batch_idx, (imgs, targets) in enumerate(train_loader):
+            train_iter = train_epoch * self.iter_per_epoch + batch_idx + 1
+            if train_iter % 30000 == 0 and 'wideresnet' in self.args.arch_type:
+                for g in optimizer.param_groups:
+                    g['lr'] /= 5
+                    args.prune_prob /= 5
             optimizer.zero_grad()
             #imgs, targets = next(train_loader)
             imgs, targets = imgs.to(self.device), targets.to(self.device)
@@ -249,12 +273,12 @@ class LTH():
             train_loss.backward()
             metric.update(train_loss.detach().cpu())
             # Freezing Pruned weights by making their gradients Zero
-            for name, p in model.named_parameters():
-                if 'weight' in name:
-                    tensor = p.data
-                    grad_tensor = p.grad.data
-                    grad_tensor = torch.where(torch.abs(tensor) < EPS, 0, grad_tensor)
-                    p.grad.data = grad_tensor.to(self.device)
+            # for name, p in model.named_parameters():
+            #     if 'weight' in name:
+            #         tensor = p.data
+            #         grad_tensor = p.grad.data
+            #         grad_tensor = torch.where(torch.abs(tensor) < EPS, 0, grad_tensor)
+            #         p.grad.data = grad_tensor.to(self.device)
 
             optimizer.step()
         
@@ -305,8 +329,19 @@ class LTH():
             ini_model = vgg.vgg16_bn(num_classes=10).to(self.device)
         elif args.arch_type == "vgg19":
             ini_model = vgg.vgg19_bn(num_classes=10).to(self.device)
-        elif args.arch_type == "resnet18":
-            ini_model = resnet.resnet18().to(self.device)   
+        elif args.arch_type == "resnet50":
+            ini_model = resnet.ResNet50().to(self.device)
+            args.lr = 0.1
+            args.weight_decay = 0.0001
+            args.momentum = 0.9
+            # args.train_epochs = 160
+        elif "wideresnet" in args.arch_type:
+            ini_model = wide_resnet.Wide_ResNet(depth=22, widen_factor=2, dropout_rate=0.3, num_classes=10).to(self.device)
+            args.weight_decay = 5e-4
+            args.lr = 0.1
+            args.train_epochs = 1
+            args.batch_size = 128
+            args.momentum = 0.9
         elif args.arch_type == "densenet121":
             ini_model = densenet.densenet121().to(self.device)   
         # If you want to add extra model paste here
