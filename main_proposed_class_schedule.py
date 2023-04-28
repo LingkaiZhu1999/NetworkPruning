@@ -59,6 +59,7 @@ parser.add_argument("--weight_decay", default=0.0005, type=float, help="weight d
 parser.add_argument("--val_set", default=False, help="whether have a val set", type=bool)
 parser.add_argument("--fixed_budget", default=False, type=bool)
 parser.add_argument("--end_update_iter_ratio", default=0.8, type=float)
+parser.add_argument("--importance_scores", default='', type=str)
 parser.add_argument("--seed", default=1, type=int)
 # parser.add_argument("--prune_ratio", default=1, type=float, help="Prune ratio during train")
 # parser.add_argument("--output_target_ratio", default=5, type=float)
@@ -119,6 +120,7 @@ class Proposed_prune():
         
         self.parameters_to_prune = []
         self.initial_num_weights = []
+        self.importance_scores = {} if args.importance_scores != '' else None
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
                 if name == 'conv1' or name == 'features.0':
@@ -150,8 +152,8 @@ class Proposed_prune():
         else:
             raise Exception('Invalid prune type.')
         
-        self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}_prob_{args.prune_prob}_{args.prune_type}_target_ratio_{args.target_ratio}/{args.dataset}/"
-        self.plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}_prob_{args.prune_prob}_{args.prune_type}_target_ratio_{args.target_ratio}/{args.dataset}/"
+        self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}_prob_{args.prune_prob}_{args.prune_type}_target_ratio_{args.target_ratio}_end_update_iter_ratio_{args.end_update_iter_ratio}/{args.dataset}/"
+        self.plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_percent_{args.initial_percent}_prob_{args.prune_prob}_{args.prune_type}_target_ratio_{args.target_ratio}_end_update_iter_ratio_{args.end_update_iter_ratio}/{args.dataset}/"
         utils.checkdir(self.save_path)
         utils.checkdir(self.plot_path)
         with open(os.path.join(self.save_path, "args.txt"), 'w') as f:
@@ -300,7 +302,9 @@ class Proposed_prune():
             train_loss = criterion(output, targets)
             train_loss.backward()
             metric.update(train_loss.detach().cpu())
-
+            if self.importance_scores is not None:
+                for module, _ in self.parameters_to_prune:
+                    self.importance_scores.update({(module, 'weight'): module.weight_orig.grad * module.weight})
             optimizer.step()
             # if train_epoch < self.args.train_epochs:
             if train_iter <= int(self.args.end_update_iter_ratio * self.total_iter):
@@ -344,16 +348,10 @@ class Proposed_prune():
                     for module, name in self.parameters_to_prune:
                         prune_and_connect(module, name, amount_prune=prune_ratio, amount_add=prune_ratio)
             elif args.prune_type == 'global':
-                # for module, name in self.parameters_to_prune:
-                #     prune.remove(module, name)
-                # expected_ratio = 1. - self.expected_ratio_schedule(train_iter, self.alpha)
-                # prune_ratio = 1. - self.pruning_schedule(train_iter, self.alpha - 1)
                 if self.args.fixed_budget == False:
                     prune_ratio = 1. - self.pruning_schedule_exp(train_iter, self.alpha)
-                # add_ratio = prune_ratio - expected_ratio
-                    # print(self.initial_num_weights.sum() * prune_ratio, already_pruned.sum())
                     to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
-                    global_unstructure.global_unstructured(self.parameters_to_prune, pruning_method=Prune_and_Reconnect, amount_prune=to_prune*2, amount_add=to_prune)
+                    global_unstructure.global_unstructured(self.parameters_to_prune, pruning_method=Prune_and_Reconnect, amount_prune=to_prune*2, amount_add=to_prune, importance_scores=self.importance_scores)
                 else:
                     prune_ratio = self.pruning_schedule_exp(train_iter, self.alpha)
                     # prune_ratio = 0.5*(1. - self.pruning_schedule_exp(train_iter, self.alpha))
