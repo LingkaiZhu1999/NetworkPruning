@@ -36,14 +36,13 @@ class Prune_and_Reconnect(BasePruningMethod):
         _validate_pruning_amount(nparams_toadd, tensor_size)
         mask = default_mask.clone(memory_format=torch.contiguous_format)
 
-        if nparams_toprune != 0 and nparams_toadd != 0:  # k=0 not supported by torch.kthvalue
+        if nparams_toprune != 0:  # k=0 not supported by torch.kthvalue
             # largest=True --> top k; largest=False --> bottom k
             # Prune the smallest k
             topk = torch.topk(torch.abs(t).view(-1), k=nparams_toprune, largest=False)
             # topk will have .indices and .values
             mask_bef_pru = mask.clone(memory_format=torch.contiguous_format)
             mask.view(-1)[topk.indices] = 0
-
             zero_indices = (mask_bef_pru.view(-1) == 0).nonzero() if torch.count_nonzero(mask_bef_pru.view(-1)==0) >=1 else (mask.view(-1) == 0).nonzero()
             try: 
                 del mask_bef_pru
