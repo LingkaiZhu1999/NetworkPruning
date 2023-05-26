@@ -26,8 +26,10 @@ import random
 import matplotlib.pyplot as plt
 from data import Data
 from archs.cifar10 import VGG16, AlexNet, LeNet5, fc1, resnet, densenet, vgg, wide_resnet
-from prune_and_reconnect import Prune_and_Reconnect, prune_and_connect
+from prune_and_reconnect import Prune_and_Reconnect, prune_and_connect, Prune_and_Reconnect_with_different_criteria, Prune_and_Reconnect_with_multiple_criteria,\
+Prune_GradfromW_Add_Grad, Prune_rankW_add_rankGrad_Add_Grad, Prune_rankW_add_rankGrad_Add_Random, Prune_rankW_mul_rankGrad_Add_Random, Prune_rankW_mul_rankGrad_Add_Grad, Prune_rankW_add_rankGrad, Prune_WfromGrad_Add_Grad
 import global_unstructure
+import global_unstructure_double_importance_scores
 import pandas as pd
 # from fvcore.nn import FlopCountAnalysis
 # from ptflops import get_model_complexity_info
@@ -51,7 +53,7 @@ parser.add_argument("--dataset", default="cifar10", type=str, help="mnist | cifa
 parser.add_argument("--arch-type", default="vgg16", type=str, help="fc1 | advanced_dropout_fc| lenet5 | alexnet | vgg16 | resnet18 | densenet121")
 parser.add_argument("--initial-ratio", default=100, type=float, help='percentage of the weights that is trainable and initialized')
 parser.add_argument("--target-ratio", default=5, type=float, )
-parser.add_argument("--prune-ratio", default=1, type=float)
+parser.add_argument("--prune-rate", default=1, type=float)
 parser.add_argument("--prune-conv1", default=False, type=bool)
 parser.add_argument("--optimizer", default="sgd", help="adam | sgd", type=str)
 parser.add_argument("--momentum", default=0.9, type=float)
@@ -59,12 +61,12 @@ parser.add_argument("--weight-decay", default=0.0005, type=float, help="weight d
 parser.add_argument("--val-set", default=False, help="whether have a val set", type=bool)
 parser.add_argument("--fixed-budget", default=False, type=bool)
 parser.add_argument("--end-update-iter-ratio", default=0.8, type=float)
-parser.add_argument("--prune-criterion", default='', type=str)
+parser.add_argument("--prune-criterion", default="", type=str)
+parser.add_argument("--add-criterion", default="", type=str)
+parser.add_argument("--schedule-function", default='cubic', type=str, help='exp or cubic scheduling functions')
+parser.add_argument("--moving-average-alpha", default=0.5, type=float)
+parser.add_argument("--update-interval", type=int, default=1000)
 parser.add_argument("--seed", default=1, type=int)
-# parser.add_argument("--prune_ratio", default=1, type=float, help="Prune ratio during train")
-# parser.add_argument("--output_target_ratio", default=5, type=float)
-# parser.add_argument("--prune_prob", default=None, type=float, help="probability to prune during train")
-# parser.add_argument("--prune_and_add_ratio", default=5, type=float, help="the ratio of weights pruned and added")
 args = parser.parse_args()
 
 torch.cuda.manual_seed_all(args.seed)
@@ -125,9 +127,13 @@ class Proposed_prune():
             self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
             self.test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=4,drop_last=False)
         
+        self.prune_rate_decay = CosineDecay(prune_rate=args.prune_rate*0.01, T_max=len(self.train_loader)*self.train_epochs)
         self.parameters_to_prune = []
         self.initial_num_weights = []
-        self.importance_scores = {} if args.prune_criterion != '' else None
+        self.importance_scores_prune = {} 
+        self.importance_scores_add = {}
+        if self.args.prune_criterion == "Rank(|w|) + Rank(|grad|)" or self.args.prune_criterion == "Rank(|w|) * Rank(|grad|)":
+            self.importance_scores_prune1 = {} 
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
                 if name == 'conv1' or name == 'features.0':
@@ -143,24 +149,23 @@ class Proposed_prune():
         self.initial_num_weights = np.array(self.initial_num_weights)
         self.parameters_to_prune = tuple(self.parameters_to_prune)
         self.iter_per_epoch = int(np.ceil(len(train_dataset) / args.batch_size))
-        self.total_iter = self.iter_per_epoch * args.train_epochs
+        self.total_iter = len(self.train_loader) * args.train_epochs
         if args.prune_type == 'local':
             for layer, name in self.parameters_to_prune:
                 prune.random_unstructured(layer, name=name, amount=1.0-args.initial_ratio*0.01)
                 self.alpha = np.log(args.target_ratio*0.01)
-                # self.alpha_b = np.log(args.output_target_ratio*0.01)
         elif args.prune_type == 'global':
             try: 
                 prune.random_unstructured(self.model.conv1, 'weight', amount=0.)
             except:
                 prune.random_unstructured(self.model.features[0], 'weight', amount=0.)
             prune.global_unstructured(self.parameters_to_prune, pruning_method=prune.RandomUnstructured, amount=1.0-args.initial_ratio*0.01)
-            self.alpha = np.log(args.target_ratio * 0.01)
+            self.alpha = np.log((args.target_ratio * 0.01) / (args.initial_ratio * 0.01))
         else:
             raise Exception('Invalid prune type.')
         
-        self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_ratio_{args.initial_ratio}_{args.prune_type}_target_ratio_{args.target_ratio}_end_update_iter_ratio_{args.end_update_iter_ratio}_prune_ratio_{args.prune_ratio}_seed_{args.seed}/{args.dataset}/"
-        self.plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_ratio_{args.initial_ratio}_{args.prune_type}_target_ratio_{args.target_ratio}_end_update_iter_ratio_{args.end_update_iter_ratio}_prune_ratio_{args.prune_ratio}_seed_{args.seed}/{args.dataset}/"
+        self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_ratio_{args.initial_ratio}_{args.prune_type}_target_ratio_{args.target_ratio}_end_update_iter_ratio_{args.end_update_iter_ratio}_prune_rate_{args.prune_rate}_seed_{args.seed}/{args.dataset}/"
+        self.plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_ratio_{args.initial_ratio}_{args.prune_type}_target_ratio_{args.target_ratio}_end_update_iter_ratio_{args.end_update_iter_ratio}_prune_rate_{args.prune_rate}_seed_{args.seed}/{args.dataset}/"
         utils.checkdir(self.save_path)
         utils.checkdir(self.plot_path)
         with open(os.path.join(self.save_path, "args.txt"), 'w') as f:
@@ -177,7 +182,7 @@ class Proposed_prune():
         if args.optimizer == 'adam':
             optimizer = torch.optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         elif args.optimizer == 'sgd':
-            optimizer = torch.optim.SGD(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum)
+            optimizer = torch.optim.SGD(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum, nesterov=True)
         else:
             raise Exception('wrong optimizer, has to be adam or sgd')
         if 'vgg' in self.args.arch_type:
@@ -191,8 +196,6 @@ class Proposed_prune():
         bestacc = np.zeros(train_epochs,float)
         testacc = np.zeros(train_epochs, float)
         sparsity_ = np.zeros(train_epochs, float)
-        flops_ = np.zeros(train_epochs, float)
-        step = 0
         all_loss = np.zeros(train_epochs,float)
         valacc = np.zeros(train_epochs,float)
         early_stop_trigger = 0
@@ -202,7 +205,6 @@ class Proposed_prune():
         sparsity_[0] = sparsity
         comp[0] = comp1
         pbar = tqdm(range(args.train_epochs))
-        flops_total = 0
         for train_epoch in pbar:
             # Frequency for Testing
             if (train_epoch % args.valid_freq == 0) and (self.args.val_set == True):
@@ -218,23 +220,20 @@ class Proposed_prune():
                 valacc[train_epoch] = val_accuracy
             
             # Training
-            loss, flops_epoch = self.train(self.model, self.train_loader, optimizer, criterion, train_epoch, self.args)
+            loss = self.train(self.model, self.train_loader, optimizer, criterion, train_epoch, self.args)
             
             lr_scheduler.step()
 
-            flops_total += flops_epoch
-            flops_[train_epoch] = flops_total
             all_loss[train_epoch] = loss
             # Frequency for Printing Accuracy and Loss
             if (train_epoch % args.print_freq == 0) and (self.args.val_set == True):
                 pbar.set_description(
-                    f'Train Epoch: {train_epoch}/{args.train_epochs} LR: {optimizer.param_groups[-1]["lr"]} FLOPs: {flops_epoch} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
+                    f'Train Epoch: {train_epoch}/{args.train_epochs} LR: {optimizer.param_groups[-1]["lr"]} Loss: {loss:.6f} Prune rate: {self.prune_rate_decay.get_dr()} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
             else:
                 pbar.set_description(
-                    f'Train Epoch: {train_epoch}/{args.train_epochs} LR: {optimizer.param_groups[-1]["lr"]} FLOPs: {flops_epoch} Loss: {loss:.6f}')
+                    f'Train Epoch: {train_epoch}/{args.train_epochs} LR: {optimizer.param_groups[-1]["lr"]} Loss: {loss:.6f} Prune rate: {self.prune_rate_decay.get_dr()}')
             if args.early_stop is not None and early_stop_trigger > args.early_stop:
                 break
-
             comp1 = utils.print_nonzeros_lth(self.model.named_modules(), writer, train_epoch)
             sparsity_[train_epoch] = round(100.0 - comp1, 1)
             
@@ -252,70 +251,76 @@ class Proposed_prune():
                 else:
                     test_accuracy = self.test(self.model, self.test_loader, criterion)
 
-                
             print(f'Test Accuracy: {test_accuracy}')
             writer.add_scalar('Accuracy_sparsity/val', best_accuracy, sparsity)
             writer.add_scalar('Accuracy_sparsity/test', test_accuracy, sparsity)
             writer.add_scalar('Accuracy_epoch/test', test_accuracy, train_epoch)
             bestacc[0] = best_accuracy
             testacc[train_epoch] = test_accuracy
-            fig_test = utils.plot_sparsity_testacc(sparsity_[10:train_epoch+1], testacc[10:train_epoch+1], self.plot_path, name='test')
-            fig_val = utils.plot_sparsity_testacc(sparsity_[10:train_epoch+1], valacc[10:train_epoch+1], self.plot_path, name='val')
+            fig_test = utils.plot_sparsity_testacc(sparsity_[20:train_epoch+1], testacc[20:train_epoch+1], self.plot_path, name='test')
+            fig_val = utils.plot_sparsity_testacc(sparsity_[20:train_epoch+1], valacc[20:train_epoch+1], self.plot_path, name='val')
             writer.add_figure('sparsity_testacc', fig_test, train_epoch)
             writer.add_figure('sparsity_valacc', fig_val, train_epoch)
-            d = {'sparsity': sparsity_[: train_epoch+1], 'testacc': testacc[:train_epoch+1], 'flops': flops_[:train_epoch+1]}
+            d = {'sparsity': sparsity_[: train_epoch+1], 'testacc': testacc[:train_epoch+1]}
             df = pd.DataFrame(data=d)
             df.to_csv(f"{self.save_path}/sparsity_vs_testacc.csv")
         torch.save(self.model, os.path.join(self.save_path, f"final_model_{args.prune_type}.pt"))
-
-        # for name, p in self.model.named_parameters():
-        #     weight_nz = p[torch.nonzero(p, as_tuple=True)]
-        #     plt.hist(weight_nz.cpu().data.view(-1), bins=30)
-        #     plt.savefig(os.path.join(self.plot_path, f"{name}.png"))
-        #     plt.close()
 
 
 
     def train(self, model, train_loader, optimizer, criterion, train_epoch, args):
         metric = MeanMetric()
         model.train()
-        flops = 0
         if len(self.args.prune_criterion) > 0:
-             for module, _ in self.parameters_to_prune:
-                    self.importance_scores.update({(module, 'weight'): module.weight})
+            if self.args.prune_criterion == "average w":
+                for module, _ in self.parameters_to_prune:
+                    self.importance_scores_prune.update({(module, 'weight'): module.weight})
+            elif self.args.prune_criterion == "average grad":
+                for module, _ in self.parameters_to_prune:
+                    self.importance_scores_prune.update({(module, 'weight'): module.weight_orig.grad})
         for batch_idx, (imgs, targets) in enumerate(train_loader):
-            train_iter = train_epoch * self.iter_per_epoch + batch_idx + 1
-                    # args.prune_prob /= 5
-
-            # with torch.no_grad():
-            # b, c, h, w = imgs.shape
-            # flops_temp, _ = get_model_complexity_info(model, (b, c, h, w), as_strings=False, print_per_layer_stat=False, verbose=False)
-            # flops += flops_temp
-            # del model.__dict__["start_flops_count"], model.__dict__["stop_flops_count"], model.__dict__["reset_flops_count"], model.__dict__["compute_average_flops_cost"]
+            train_iter = train_epoch * len(self.train_loader) + batch_idx + 1
             optimizer.zero_grad()
             imgs, targets = imgs.to(self.device), targets.to(self.device)
             output = model(imgs)
             train_loss = criterion(output, targets)
             train_loss.backward()
             metric.update(train_loss.detach().cpu())
-            if self.args.prune_criterion == "gradw":
+            if self.args.prune_criterion == "|gradw|" and (train_iter % self.args.update_interval == 0):
                 for module, _ in self.parameters_to_prune:
-                    self.importance_scores.update({(module, 'weight'): module.weight_orig.grad * module.weight})
-            elif self.args.prune_criterion == "|grad| + |w|":
+                    self.importance_scores_prune.update({(module, 'weight'): module.weight_orig.grad * module.weight})
+            elif self.args.prune_criterion == "|w|" and (train_iter % self.args.update_interval == 0):
+                self.importance_scores_prune = None
+            elif self.args.prune_criterion == "Rank(|w|) + Rank(|grad|)" or self.args.prune_criterion == "Rank(|w|) * Rank(|grad|)":
                 for module, _ in self.parameters_to_prune:
-                    self.importance_scores.update({(module, 'weight'): torch.abs(module.weight_orig.grad) + torch.abs(module.weight)})
+                    self.importance_scores_prune1.update({(module, 'weight'): module.weight_orig.grad})
+            elif self.args.prune_criterion == "|grad|":
+                for module, _ in self.parameters_to_prune:
+                    self.importance_scores_prune.update({(module, 'weight'): module.weight_orig.grad})
             elif self.args.prune_criterion == "average w":
                 for module, _ in self.parameters_to_prune:
-                    self.importance_scores.update({(module, 'weight'): 0.5 * self.importance_scores.get((module, 'weight')) + module.weight})
-            optimizer.step()
-            # if train_epoch < self.args.train_epochs:
+                    self.importance_scores_prune.update({(module, 'weight'): self.args.moving_average_alpha * self.importance_scores_prune.get((module, 'weight')) + (1 - self.args.moving_average_alpha) * module.weight})
+            elif self.args.prune_criterion == "average grad":
+                for module, _ in self.parameters_to_prune:
+                    self.importance_scores_prune.update({(module, 'weight'): self.args.moving_average_alpha * self.importance_scores_prune.get((module, 'weight')) + (1 - self.args.moving_average_alpha) * module.weight_orig.grad})
+            # elif self.args.prune_criterion == "Rank(|w|) + Rank(|grad|)":
+            #     for module, _ in self.parameters_to_prune:
+            #         self.importance_scores_prune.update({(module, 'weight'): torch.abs(module.weight).sort(descending=False).indices + torch.abs(module.weight_orig.grad).sort(descending=False).indices})
+                # if (batch_idx + 1 == int(0.1 * self.iter_per_epoch + 1)) or (batch_idx + 1 == int(0.3 * self.iter_per_epoch + 1)) or (batch_idx + 1 == int(0.5 * self.iter_per_epoch + 1)) or (batch_idx + 1 == int(0.7 * self.iter_per_epoch + 1)) or (batch_idx + 1 == int(0.9 * self.iter_per_epoch + 1)):
+                #     for module, _ in self.parameters_to_prune:
+                #         self.importance_scores_prune.update({(module, 'weight'): module.weight})
+            if self.args.add_criterion == "|grad|":
+                for module, _ in self.parameters_to_prune:
+                    self.importance_scores_add.update({(module, 'weight'): module.weight_orig.grad})
+            elif self.args.add_criterion == "random" or self.args.add_criterion == "|w|":
+                self.importance_scores_add = None
+            self.prune_rate_decay.step()
+            optimizer.step() 
             if train_iter <= int(self.args.end_update_iter_ratio * self.total_iter):
-                self.prune_and_reconnect(train_iter, batch_idx)
+                self.prune_and_reconnect(train_iter)
             else:
                 pass
-        ### run for each epoch ###
-        # self.prune_and_reconnect(model, self.args.prune_prob, train_iter)
-        return metric.compute().item(), flops
+        return metric.compute().item()
 
     def test(self, model, test_loader, criterion):
         model.eval()
@@ -332,68 +337,99 @@ class Proposed_prune():
             accuracy = 100. * correct / len(test_loader.dataset)
         return accuracy
     
-    def prune_and_reconnect(self, train_iter, batch_iter):
-        if (batch_iter + 1 == int(0.1 * self.iter_per_epoch)) or (batch_iter + 1 == int(0.3 * self.iter_per_epoch)) or (batch_iter + 1 == int(0.5 * self.iter_per_epoch)) or (batch_iter + 1 == int(0.7 * self.iter_per_epoch)) or (batch_iter + 1 == int(0.9 * self.iter_per_epoch)):
-            mask_bef_pru = []
-            prune_num_iter = []
-            already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
-            # prune the connections
-            if args.prune_type == 'local':
-                if self.args.fixed_budget == False:
-                    expected_ratio = 1. - self.expected_ratio_schedule(train_iter, self.alpha)
-                    prune_ratio = 1. - self.pruning_schedule_exp(train_iter, self.alpha - 1)
-                    add_ratio = prune_ratio - expected_ratio
-                    for module, name in self.parameters_to_prune:
-                        prune_and_connect(module, name, amount_prune=prune_ratio, amount_add=add_ratio)
-                else:
-                    prune_ratio = self.pruning_schedule_exp(train_iter, self.alpha)
-                    for module, name in self.parameters_to_prune:
-                        prune_and_connect(module, name, amount_prune=prune_ratio, amount_add=prune_ratio)
-            elif args.prune_type == 'global':
-                if self.args.fixed_budget == False:
-                    prune_ratio = 1. - self.pruning_schedule_exp(train_iter, self.alpha)
-                    to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
-                    remain = self.initial_num_weights.sum() - already_pruned.sum()
-                    to_prune_t = np.maximum(to_prune, int(np.floor(remain * self.args.prune_ratio*0.01)))
-                    to_add_t = to_prune_t - to_prune
+    def prune_and_reconnect(self, train_iter):
+        if train_iter % self.args.update_interval == 0:
+            if self.args.add_criterion == "random":
+                for name, module in self.model.named_modules():
+                    if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                        prune.remove(module, 'weight')
+                prune_ratio = 1. - self.schedule_function(train_iter)
+                add_ratio = self.prune_rate_decay.get_dr() * self.schedule_function(train_iter)
+                if self.args.prune_criterion == "|w|":
+                    global_unstructure.global_unstructured(self.parameters_to_prune, pruning_method=Prune_and_Reconnect, amount_prune=prune_ratio+add_ratio, amount_add=add_ratio, importance_scores=self.importance_scores_prune)
+                elif self.args.prune_criterion == "Rank(|w|) + Rank(|grad|)":
+                    global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_rankW_add_rankGrad_Add_Random, amount_prune=prune_ratio+add_ratio, amount_add=add_ratio, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_prune1)
+                elif self.args.prune_criterion == "Rank(|w|) * Rank(|grad|)":
+                    global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_rankW_mul_rankGrad_Add_Random, amount_prune=prune_ratio+add_ratio, amount_add=add_ratio, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_prune1)
+
+
+            elif self.args.add_criterion == "|grad|":
+                already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
+                prune_ratio = 1. - self.schedule_function(train_iter)
+                to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
+                remain = self.initial_num_weights.sum() - already_pruned.sum()
+                to_prune_t = to_prune
+                to_add_t = int((remain - to_prune_t) * self.prune_rate_decay.get_dr())
+                if self.args.prune_criterion == "|w|":
+                    global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_GradfromW_Add_Grad, amount_prune=(to_prune_t+to_add_t), amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
+                elif self.args.prune_criterion == "Rank(|w|) + Rank(|grad|)":
+                    global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_rankW_add_rankGrad_Add_Grad, amount_prune=(to_prune_t+to_add_t), amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_prune1)
+                elif self.args.prune_criterion == "Rank(|w|) * Rank(|grad|)":
+                    global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_rankW_mul_rankGrad_Add_Grad, amount_prune=(to_prune_t+to_add_t), amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_prune1)
+            elif self.args.add_criterion == "":
+                already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
+                prune_ratio = 1. - self.schedule_function(train_iter)
+                to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
+                if self.args.prune_criterion == "Rank(|w|) + Rank(|grad|)":
+                    global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_rankW_add_rankGrad, amount_prune=prune_ratio, amount_add=0, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
+            elif self.args.add_criterion == "|w|":
+                already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
+                prune_ratio = 1. - self.schedule_function(train_iter)
+                to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
+                remain = self.initial_num_weights.sum() - already_pruned.sum()
+                to_add_t = int(0.5*remain) - to_prune
+                to_prune_t = to_prune
+                # to_add_t = int((remain - to_prune_t) * self.prune_rate_decay.get_dr())
+                if self.args.prune_criterion == "|grad|":
+                    global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_WfromGrad_Add_Grad,  amount_prune=0.5, amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
+            
+                
+
+
+
                     
+
+
+
+                # elif self.args.prune_criterion == ""
+            # already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
+                # if self.args.fixed_budget == False:
+                    
+                    # to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
+                    # remain = self.initial_num_weights.sum() - already_pruned.sum()
+                    # to_prune_t = np.maximum(to_prune, int(np.floor(remain * self.args.prune_rate*0.01)))
+                    # to_add_t = to_prune_t - to_prune
+                    # to_prune_t = to_prune
+                    # prune_rate = self.prune_rate_decay.get_dr()
+                    # to_add_t = int((remain - to_prune_t) * prune_rate)
+                    # print("prune", (to_prune_t+to_add_t+already_pruned.sum())/self.initial_num_weights.sum())
+                    # print("add", to_add_t/self.initial_num_weights.sum())
                     # prune_and_add = int(np.floor(self.initial_num_weights.sum() * self.args.prune_and_add_ratio))
+                    # if self.args.mode == "Rank(|w|) + Rank(|grad|)":
+                    #     global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_rankW_add_rankGrad_Add_Grad, amount_prune=(to_prune_t+to_add_t), amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
+
+                    # if self.args.add_criterion == "grad":
+                    #     global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_GradfromW_Add_Grad, amount_prune=(to_prune_t+to_add_t), amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
                     
-                    # previously prune 2*to_prune, add to_prune
-                    global_unstructure.global_unstructured(self.parameters_to_prune, pruning_method=Prune_and_Reconnect, amount_prune=to_prune_t, amount_add=to_add_t, importance_scores=self.importance_scores)
-                else:
-                    prune_ratio = self.pruning_schedule_exp(train_iter, self.alpha)
-                    # prune_ratio = 0.5*(1. - self.pruning_schedule_exp(train_iter, self.alpha))
-                    global_unstructure.global_unstructured(self.parameters_to_prune, pruning_method=Prune_and_Reconnect, amount_prune=prune_ratio, amount_add=prune_ratio)
+                    # else:
+                    # global_unstructure.global_unstructured(self.parameters_to_prune, pruning_method=Prune_and_Reconnect, amount_prune=to_prune_t+to_add_t, amount_add=to_add_t, importance_scores=self.importance_scores_prune)
+    def schedule_function(self, cur_iter):
+        if self.args.schedule_function == "exp":
+            return self.args.initial_ratio * 0.01 * np.exp(self.alpha * cur_iter / int(self.total_iter * self.args.end_update_iter_ratio))
+        elif self.args.schedule_function == "cubic":
+            return self.args.target_ratio * 0.01 + 0.01*(self.args.initial_ratio - self.args.target_ratio)*(1 - (cur_iter/(int(self.total_iter * self.args.end_update_iter_ratio))))**3
     
-    def expected_ratio_schedule(self, cur_iter, alpha=0):
-        return np.exp(alpha * cur_iter / self.total_iter)
-        # return np.cos(np.arccos(self.args.target_ratio*0.01)*cur_iter/self.total_iter)
-    
-    def pruning_schedule_exp(self, cur_iter, alpha=0):
-        return np.exp(alpha * cur_iter / int(self.total_iter * self.args.end_update_iter_ratio))
-        # return 0.99*np.cos(np.arccos(self.args.target_ratio*0.01)*cur_iter/self.total_iter)
-    
-    def pruning_schedule_cos(self, cur_iter, alpha=0):
-        self.alpha = np.arccos(2 * (self.args.target_ratio * 0.01 - 0.5))
-        return 0.5 * (1 + np.cos(self.alpha*cur_iter/self.total_iter))
-    
-    def pruning_schedule_cos_fixed_ratio(self, cur_iter):
-        return 0.5 * (1 + np.cos(self.alpha*cur_iter/self.total_iter))
-    def exp_adding_schedule(self, cur_iter, alpha=-1):
-        return 1. - np.exp(alpha * cur_iter / self.total_iter)
-    
-    # def exp_annealing_prob(self, cur_iter):
-    #     return 0.01 * np.exp(- cur_iter / self.total_iter)
+class CosineDecay(object):
+    def __init__(self, prune_rate, T_max, eta_min=0.005, last_epoch=-1):
+        self.sgd = torch.optim.SGD(torch.nn.ParameterList([torch.nn.Parameter(torch.zeros(1))]), lr=prune_rate)
+        self.cosine_stepper = torch.optim.lr_scheduler.CosineAnnealingLR(self.sgd, T_max, eta_min, last_epoch)
 
-    # def when_to_prune(self, iter):
-    #     if self.args.prune_prob is None:
-    #         return 1/2*(1+np.cos(np.pi*iter/self.total_iter))
-    #         # alpha = np.arccos(2 * (0.005 - 0.5))
-    #         # return 1/2*(1+np.cos(alpha*iter/self.total_iter))
-    #     else:
-    #         return self.args.prune_prob
+    def step(self):
+        self.cosine_stepper.step()
 
+    def get_dr(self):
+        return self.sgd.param_groups[0]['lr']
+    
 def main():
     proposed_prune = Proposed_prune(args)
     proposed_prune.prune()
