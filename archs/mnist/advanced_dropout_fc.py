@@ -1,14 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-class fc1(nn.Module):
+class advanced_drop_fc(nn.Module):
 
     def __init__(self, num_classes=10):
-        super(fc1, self).__init__()
-        self.fc1 = nn.Linear(3*32*32, 300)
-        self.fc2 = nn.Linear(300, 100)
-        self.fc3 = nn.Linear(100, num_classes)
+        super(advanced_drop_fc, self).__init__()
+        self.fc1 = nn.Linear(28*28, 800)
+        self.fc2 = nn.Linear(800, 800)
+        self.fc3 = nn.Linear(800, num_classes)
 
         # self.classifier = nn.Sequential(
         #     nn.Linear(28*28, 300),
