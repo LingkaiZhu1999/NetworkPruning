@@ -66,6 +66,7 @@ parser.add_argument("--add-criterion", default="", type=str)
 parser.add_argument("--schedule-function", default='cubic', type=str, help='exp or cubic scheduling functions')
 parser.add_argument("--moving-average-alpha", default=0.5, type=float)
 parser.add_argument("--update-interval", type=int, default=1000)
+parser.add_argument("--init-type", type=str, default="")
 parser.add_argument("--seed", default=1, type=int)
 args = parser.parse_args()
 
@@ -99,9 +100,9 @@ class Proposed_prune():
         elif args.arch_type == "resnet50":
             self.model = resnet.ResNet50().to(self.device)
             args.lr = 0.1
-            args.weight_decay = 0.0001
+            args.weight_decay = 0.0005
             args.momentum = 0.9
-            args.train_epochs = 90
+            # args.train_epochs = 90
         elif "wideresnet" in args.arch_type:
             self.model = wide_resnet.Wide_ResNet(depth=22, widen_factor=2, dropout_rate=0, num_classes=10).to(self.device)
             args.weight_decay = 5e-4
@@ -152,17 +153,76 @@ class Proposed_prune():
         self.total_iter = len(self.train_loader) * args.train_epochs
         if args.prune_type == 'local':
             for layer, name in self.parameters_to_prune:
-                prune.random_unstructured(layer, name=name, amount=1.0-args.initial_ratio*0.01)
+                prune.random_unstructured(layer, name=name, amount=0)
                 self.alpha = np.log(args.target_ratio*0.01)
         elif args.prune_type == 'global':
             try: 
                 prune.random_unstructured(self.model.conv1, 'weight', amount=0.)
             except:
                 prune.random_unstructured(self.model.features[0], 'weight', amount=0.)
-            prune.global_unstructured(self.parameters_to_prune, pruning_method=prune.RandomUnstructured, amount=1.0-args.initial_ratio*0.01)
+            prune.global_unstructured(self.parameters_to_prune, pruning_method=prune.RandomUnstructured, amount=0)
             self.alpha = np.log((args.target_ratio * 0.01) / (args.initial_ratio * 0.01))
         else:
             raise Exception('Invalid prune type.')
+        
+        if self.args.init_type == "ERK":
+            # adapted from GraNet's code https://github.com/VITA-Group/GraNet 
+            is_epsilon_valid = False
+            erk_power_scale = 1.0
+            dense_layers = set()
+
+            while not is_epsilon_valid:
+
+                divisor = 0
+                rhs =  0
+                raw_probabilities = {}
+                for name, module in self.model.named_modules():
+                    if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                        n_param = np.prod(module.weight.shape)
+                        n_zeros = n_param * (1 - self.args.initial_ratio * 0.01)
+                        n_ones = n_param * self.args.initial_ratio * 0.01
+
+                        if name in dense_layers:
+                            rhs -= n_zeros
+
+                        else:
+                            rhs += n_ones
+                            raw_probabilities[name] = (
+                                np.sum(module.weight.shape) / np.prod(module.weight.shape)
+                            ) ** erk_power_scale
+                            divisor += raw_probabilities[name] * n_param
+                epsilon = rhs / divisor
+                max_prob = np.max(list(raw_probabilities.values()))
+                max_prob_one = max_prob * epsilon
+                if max_prob_one > 1:
+                    is_epsilon_valid = False
+                    for mask_name, mask_raw_prob in raw_probabilities.items():
+                        if mask_raw_prob == max_prob:
+                            print(f"Sparsity of var:{mask_name} had to be set to 0.")
+                            dense_layers.add(mask_name)
+                else:
+                    is_epsilon_valid = True
+            density_dict = {}
+            total_nonzero = 0.0
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                    n_param = np.prod(module.weight_mask.shape)
+                    if name in dense_layers:
+                        density_dict[name] = 1.0
+                    else:
+                        probability_one = epsilon * raw_probabilities[name]
+                        density_dict[name] = probability_one
+                    print(
+                            f"layer: {name}, shape: {module.weight_mask.shape}, nnz_ratio: {density_dict[name]}"
+                        )
+                    module.weight_mask = (torch.rand(module.weight_mask.shape) < density_dict[name]).float().data.to(self.args.device)
+                    total_nonzero += density_dict[name] * module.weight_mask.numel()
+
+            print(f"Overall sparsity {total_nonzero / self.initial_num_weights.sum()}")
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                    module.weight *= module.weight_mask
+
         
         self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_ratio_{args.initial_ratio}_{args.prune_type}_target_ratio_{args.target_ratio}_end_update_iter_ratio_{args.end_update_iter_ratio}_prune_rate_{args.prune_rate}_seed_{args.seed}/{args.dataset}/"
         self.plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}_initial_ratio_{args.initial_ratio}_{args.prune_type}_target_ratio_{args.target_ratio}_end_update_iter_ratio_{args.end_update_iter_ratio}_prune_rate_{args.prune_rate}_seed_{args.seed}/{args.dataset}/"
@@ -185,10 +245,10 @@ class Proposed_prune():
             optimizer = torch.optim.SGD(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum, nesterov=True)
         else:
             raise Exception('wrong optimizer, has to be adam or sgd')
-        if 'vgg' in self.args.arch_type:
-            lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[int(args.train_epochs / 2), int(args.train_epochs * 3 / 4)], last_epoch=-1)
-        elif 'resnet' in self.args.arch_type:
-            lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[int(args.train_epochs / 3), int(args.train_epochs * 2 / 3)], last_epoch=-1)
+        # if 'vgg' in self.args.arch_type:
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[int(args.train_epochs / 2), int(args.train_epochs * 3 / 4)], last_epoch=-1)
+        # elif 'resnet' in self.args.arch_type:
+        #     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[int(args.train_epochs / 3), int(args.train_epochs * 2 / 3)], last_epoch=-1)
         bestacc = 0.0
         best_accuracy = 0
         train_epochs = args.train_epochs
@@ -355,7 +415,8 @@ class Proposed_prune():
 
             elif self.args.add_criterion == "|grad|":
                 already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
-                prune_ratio = 1. - self.schedule_function(train_iter)
+                nnz_ratio = self.schedule_function(train_iter) if self.schedule_function(train_iter) >= 0.05 else 0.05
+                prune_ratio = 1. - nnz_ratio
                 to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
                 remain = self.initial_num_weights.sum() - already_pruned.sum()
                 to_prune_t = to_prune
@@ -378,10 +439,10 @@ class Proposed_prune():
                 to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
                 remain = self.initial_num_weights.sum() - already_pruned.sum()
                 to_add_t = int(0.5*remain) - to_prune
-                to_prune_t = to_prune
+                to_prune_t = int(0.5*remain)
                 # to_add_t = int((remain - to_prune_t) * self.prune_rate_decay.get_dr())
                 if self.args.prune_criterion == "|grad|":
-                    global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_WfromGrad_Add_Grad,  amount_prune=0.5, amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
+                    global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_WfromGrad_Add_Grad,  amount_prune=to_prune_t, amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
             
                 
 
