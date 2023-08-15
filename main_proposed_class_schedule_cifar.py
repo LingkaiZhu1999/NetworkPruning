@@ -67,6 +67,7 @@ parser.add_argument("--schedule-function", default='cubic', type=str, help='exp 
 parser.add_argument("--moving-average-alpha", default=0.5, type=float)
 parser.add_argument("--update-interval", type=int, default=2000)
 parser.add_argument("--init-type", type=str, default="")
+parser.add_argument("--select-ratio", type=float, default=0.2)
 parser.add_argument("--seed", default=1, type=int)
 args = parser.parse_args()
 
@@ -470,21 +471,48 @@ class Proposed_prune():
                 already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
                 prune_ratio = 1. - self.schedule_function(train_iter)
                 to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
+                # remain = self.initial_num_weights.sum() - already_pruned.sum()
+                # to_prune_t = to_prune
+                # to_add_t = int((remain - to_prune_t) * self.prune_rate_decay.get_dr())
+                # modification 1, exchange w and grad
+                if train_iter > int(self.args.end_update_iter_ratio * self.total_iter):
+                    to_prune = 0
                 remain = self.initial_num_weights.sum() - already_pruned.sum()
-                to_prune_t = to_prune
-                to_add_t = int((remain - to_prune_t) * self.prune_rate_decay.get_dr())
+                to_add_t = int(0.5 * remain) - to_prune
+                to_prune_t = int(0.5 * remain)
                 if self.args.prune_criterion == "|w|":
                     global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_GradfromW_Add_Grad, amount_prune=(to_prune_t+to_add_t), amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
-                elif self.args.prune_criterion == "Rank(|w|) + Rank(|grad|)":
-                    global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_rankW_add_rankGrad, amount_prune=(to_prune_t+to_add_t), amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_prune1)
-                elif self.args.prune_criterion == "Rank(|w|) * Rank(|grad|)":
-                    global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_rankW_mul_rankGrad_Add_Grad, amount_prune=(to_prune_t+to_add_t), amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_prune1)
+                # elif self.args.prune_criterion == "Rank(|w|) + Rank(|grad|)":
+                #     global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_rankW_add_rankGrad, amount_prune=(to_prune_t+to_add_t), amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_prune1)
+                # elif self.args.prune_criterion == "Rank(|w|) * Rank(|grad|)":
+                #     global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_rankW_mul_rankGrad_Add_Grad, amount_prune=(to_prune_t+to_add_t), amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_prune1)
             elif self.args.add_criterion == "":
                 already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
                 prune_ratio = 1. - self.schedule_function(train_iter)
-                to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
                 if self.args.prune_criterion == "Rank(|w|) + Rank(|grad|)":
-                    global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_rankW_add_rankGrad, amount_prune=prune_ratio, amount_add=0, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
+                    to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
+                    if self.args.prune_type == "global":
+                        global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_rankW_add_rankGrad, amount_prune=prune_ratio, amount_add=0, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
+                    else:
+                        i = 0
+                        for module, name in self.parameters_to_prune:
+                            to_prune = int(np.floor((torch.numel(module.weight) * prune_ratio - already_pruned[i])))
+                            global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(tuple([(module, 'weight')]), pruning_method=Prune_rankW_add_rankGrad, amount_prune=to_prune, amount_add=0, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
+                            i += 1
+                if self.args.prune_criterion == "Rank(|w|) * Rank(|grad|)":
+                    to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
+                    if self.args.prune_type == "global":
+                        global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_rankW_mul_rankGrad_Add_Grad, amount_prune=prune_ratio, amount_add=0, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
+                    else:
+                        i = 0
+                        for module, name in self.parameters_to_prune:
+                            to_prune = int(np.floor((torch.numel(module.weight) * prune_ratio - already_pruned[i])))
+                            global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(tuple([(module, 'weight')]), pruning_method=Prune_rankW_mul_rankGrad_Add_Grad, amount_prune=to_prune, amount_add=0, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
+                            i += 1
+                if self.args.prune_criterion == "|gradw|":
+                    to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
+                    global_unstructure.global_unstructured(self.parameters_to_prune, pruning_method=prune.L1Unstructured, amount=to_prune,importance_scores=self.importance_scores_prune)
+                        
             elif self.args.add_criterion == "|w|":
                 already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
                 prune_ratio = 1. - self.schedule_function(train_iter)
@@ -494,24 +522,18 @@ class Proposed_prune():
                     if train_iter > int(self.args.end_update_iter_ratio * self.total_iter):
                         to_prune = 0
                     remain = self.initial_num_weights.sum() - already_pruned.sum()
-                    to_add_t = int(0.5 * remain) - to_prune
-                    to_prune_t = int(0.5 * remain)
+                    to_add_t = int(self.args.select_ratio * remain) - to_prune
+                    to_prune_t = int(self.args.select_ratio * remain)
                     if to_add_t < 0:
                         to_add_t = int(0.8*remain) - to_prune
                         to_prune_t = remain
                     if self.args.prune_type == "global":
                         global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_WfromGrad_Add_Grad, amount_prune=to_prune_t, amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add) 
                     elif self.args.prune_type == "local":
-                        # to_prune = self.initial_num_weights * prune_ratio - already_pruned
-                        # remain = self.initial_num_weights - already_pruned
-                        # to_add_t = int(0.5 * remain) - to_prune
-                        # to_prune_t = int(0.5 * remain)
                         to_prune_t = to_prune_t / self.initial_num_weights.sum()
                         to_add_t = to_add_t / self.initial_num_weights.sum()
                         for module, name in self.parameters_to_prune:
                             global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(tuple([(module, 'weight')]), pruning_method=Prune_WfromGrad_Add_Grad, amount_prune=to_prune_t, amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add) 
-                            #prune_WfromGrad_Add_Grad(module, name, amount_prune=to_prune_t, amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune.get((module, 'weight')), importance_scores_add=None)
-                            #prune.l1_unstructured(module, name=name, amount=0.1)
             elif self.args.add_criterion == "|w| inter random":
                 already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
                 prune_ratio = 1. - self.schedule_function(train_iter)
