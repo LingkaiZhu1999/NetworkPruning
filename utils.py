@@ -9,36 +9,9 @@ import io
 import utils
 import torch.nn as nn
 
-#ANCHOR Print table of zeros and non-zeros count
-def print_nonzeros(model_info, writer, _ite):
+def print_nonzeros(model_info, save_path, _ite):
     nonzero = total = 0
-    info_ = ''
-    # if list(model.named_buffers()) != []:
-    #     model_info = model.named_buffers()
-    # else:
-    # model_info = model.named_parameters()   
-    for name, p in model_info:
-        tensor = p.data
-        nz_count = torch.count_nonzero(tensor).cpu().numpy()
-        total_params = np.prod(tensor.shape)
-        nonzero += nz_count
-        total += total_params
-        info = f'{name:20} | nonzeros = {nz_count:7} / {total_params:7} ({100 * nz_count / total_params:6.2f}%) | total_pruned = {total_params - nz_count :7} | shape = {tensor.shape}'
-        print(info)
-        info_ += info
-    writer.add_text("prune info", info_, _ite)
-    summary_info = f'alive: {nonzero}, pruned : {total - nonzero}, total: {total}, Compression rate : {total/nonzero:10.2f}x  ({100 * (total-nonzero) / total:6.2f}% pruned) \n'
-    print(summary_info)
-    writer.add_text("prune summary", summary_info, _ite)
-    return (round((nonzero/total)*100,1))
-
-def print_nonzeros_lth(model_info, writer, _ite):
-    nonzero = total = 0
-    info_ = ''
-    # if list(model.named_buffers()) != []:
-    #     model_info = model.named_buffers()
-    # else:
-    # model_info = model.named_parameters()   
+    info_ = '' 
     for name, p in model_info:
         if isinstance(p, nn.Conv2d) or isinstance(p, nn.Linear):
             weight = p.weight.data
@@ -49,16 +22,17 @@ def print_nonzeros_lth(model_info, writer, _ite):
             total_params_bias = np.prod(bias.shape)
             nonzero += (nz_count_weight + nz_count_bias)
             total += (total_params_weight + total_params_bias)
-            info = f'{name+".weight":20} | nonzeros = {nz_count_weight:7} / {total_params_weight:7} ({100 * nz_count_weight / total_params_weight:6.2f}%) | total_pruned = {total_params_weight - nz_count_weight :7} | shape = {weight.shape}'
-            print(info)
+            info = f'{name+".weight":20} | nonzeros = {nz_count_weight:7} / {total_params_weight:7} ({100 * nz_count_weight / total_params_weight:6.2f}%) | total_pruned = {total_params_weight - nz_count_weight :7} | shape = {weight.shape}\n'
             info_ += info
-            info = f'{name+".bias":20} | nonzeros = {nz_count_bias:7} / {total_params_bias:7} ({100 * nz_count_bias / total_params_bias:6.2f}%) | total_pruned = {total_params_bias - nz_count_bias :7} | shape = {bias.shape}'
-            print(info)
+            info = f'{name+".bias":20} | nonzeros = {nz_count_bias:7} / {total_params_bias:7} ({100 * nz_count_bias / total_params_bias:6.2f}%) | total_pruned = {total_params_bias - nz_count_bias :7} | shape = {bias.shape}\n'
             info_ += info
-    writer.add_text("prune info", info_, _ite)
-    summary_info = f'alive: {nonzero}, pruned : {total - nonzero}, total: {total}, Compression rate : {total/nonzero:10.2f}x  ({100 * (total-nonzero) / total:6.2f}% pruned) \n'
-    print(summary_info)
-    writer.add_text("prune summary", summary_info, _ite)
+    info_ += f'alive: {nonzero}, pruned : {total - nonzero}, total: {total}, Compression rate : {total/nonzero:10.2f}x  ({100 * (total-nonzero) / total:6.2f}% pruned) \n'
+    print(info_)
+    info_ += '--------------------------------------------------------------------------------------------\n'
+    # writer after the previous without the first line empty
+
+    with open(os.path.join(save_path, f"prune_summary.txt"), 'a') as f:
+        f.write(info_)
     return (round((nonzero/total)*100,1))
 
 def original_initialization(mask_temp, initial_state_dict):

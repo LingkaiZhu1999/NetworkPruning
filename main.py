@@ -12,6 +12,7 @@ import torchvision
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import matplotlib.pyplot as plt
+from torchmetrics import MeanMetric
 import os
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.utils as vutils
@@ -19,438 +20,424 @@ import seaborn as sns
 import torch.nn.init as init
 import pickle
 import torch.nn.utils.prune as prune
-# Custom Libraries
 import utils
-import PIL
-# Plotting Style
+import random
+import matplotlib.pyplot as plt
+from data import Data
+from archs.cifar10 import VGG16, AlexNet, LeNet5, fc1, resnet, densenet, vgg, wide_resnet
+from prune_and_reconnect import Prune_and_Reconnect, prune_and_connect, Prune_and_Reconnect_with_different_criteria, Prune_and_Reconnect_with_multiple_criteria,\
+Prune_GradfromW_Add_Grad, Prune_WfromGrad_Add_Grad
+import global_unstructure
+import global_unstructure_double_importance_scores
+import pandas as pd
+import math
+# from fvcore.nn import FlopCountAnalysis
+# from ptflops import get_model_complexity_info
+# from ptflops import pytorch_ops
+import copy
+# from torchstat import stat
 sns.set_style('darkgrid')
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--method", default="LTH", help="name of the method, it is Lottery Ticket Hypothesis")
-parser.add_argument("--lr",default=0.01, type=float, help="Learning rate") # learning rate have a big effect
-parser.add_argument("--batch_size", default=60, type=int)
-parser.add_argument("--start_prune_prune_round", default=0, type=int)
-parser.add_argument("--train_epochs", default=500, type=int)
-parser.add_argument("--print_freq", default=1, type=int)
-parser.add_argument("--valid_freq", default=1, type=int)
-parser.add_argument("--early_stop", default=15, type=int)
-parser.add_argument("--resume", action="store_true")
-parser.add_argument("--retrain_type", default="original", type=str, help="original | reinit")
-parser.add_argument("--prune_type", default="local", help="local | global")
-parser.add_argument("--gpu", default="1", type=str)
-parser.add_argument("--dataset", default="cifar10", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
-parser.add_argument("--arch_type", default="fc1", type=str, help="fc1 | advanced_dropout_fc | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
-parser.add_argument("--prune_percent", default=20, type=int, help="Pruning percent")
-parser.add_argument("--prune_rounds", default=30, type=int, help="Pruning args.prune_roundss count")
-parser.add_argument("--optimizer", default="sgd", help="adam | sgd")
-parser.add_argument("--weight_decay", default=1.2e-3, type=float, help="weight decay for adam optim")
+parser.add_argument("--method", default="method", help="the proposed method")
+parser.add_argument("--lr", default=0.01, type=float, help="Learning rate")
+parser.add_argument("--batch-size", default=64, type=int)
+parser.add_argument("--train-epochs", default=160, type=int)
+parser.add_argument("--fine-tune", default=0, help="fine tune the model after pruning and adding-back")
+parser.add_argument("--print-freq", default=1, type=int)
+parser.add_argument("--valid-freq", default=1, type=int)
+parser.add_argument("--early-stop", default=None, type=int)
+parser.add_argument("--prune-dist", default="local", type=str, help="distribution: local | global")
+parser.add_argument("--device", default="cuda:0", type=str)
+parser.add_argument("--dataset", default="cifar100", type=str, help="mnist | cifar10 | fashionmnist | cifar100")
+parser.add_argument("--arch-type", default="vgg19", type=str, help="fc1 | advanced_dropout_fc| lenet5 | alexnet | vgg16 | resnet18 | densenet121")
+parser.add_argument("--initial-ratio", default=100, type=float, help='percentage of the weights that is trainable and initialized')
+parser.add_argument("--target-ratio", default=5, type=float, )
+parser.add_argument("--prune-rate", default=0.5, type=float)
+parser.add_argument("--prune-conv1", default=True, type=bool)
+parser.add_argument("--optimizer", default="sgd", help="adam | sgd", type=str)
+parser.add_argument("--momentum", default=0.9, type=float)
+parser.add_argument("--weight-decay", default=0.0005, type=float, help="weight decay for adam optim")
+parser.add_argument("--val-set", default=False, help="whether have a val set", type=bool)
+parser.add_argument("--end-update-iter-ratio", default=0.8, type=float)
+parser.add_argument("--prune-criterion", default="|w|", type=str)
+parser.add_argument("--add-criterion", default="", type=str)
+parser.add_argument("--schedule-function", default='cubic', type=str, help='exp or cubic scheduling functions')
+parser.add_argument("--update-interval", type=int, default=2000)
+parser.add_argument("--init-type", type=str, default="")
+parser.add_argument("--select-ratio", type=float, default=0.5) # for the first selection 
 parser.add_argument("--seed", default=1, type=int)
-
-
 args = parser.parse_args()
 
-
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   
-os.environ["CUDA_VISIBLE_DEVICES"]=args.gpu
-save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}/{args.dataset}/"
-plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_lr_{args.lr}_{args.optimizer}/{args.dataset}/"
-utils.checkdir(save_path)
-utils.checkdir(plot_path)
-with open(os.path.join(save_path, "args.txt"), 'w') as f:
-    for arg in vars(args):
-        print('%s: %s' %(arg, getattr(args, arg)), file=f) 
-# Main
-def main(args, ITE=0):
-    # tensorboard
-    writer = SummaryWriter(save_path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    reinit = True if args.retrain_type=="reinit" else False
-    torch.cuda.manual_seed_all(args.seed)
-
-    mean = {
-        'mnist': (0.1307,),
-        'cifar10': (0.4914, 0.4822 ,0.4465),
-        'cifar100': (0.5071, 0.4867, 0.4408)
-    }
-    std = {
-        'mnist': (0.3081,),
-        'cifar10': (0.2470, 0.2435, 0.2616),
-        'cifar100': (0.2675, 0.2565, 0.2761),
-    }
-    # Data Loader
-    transform=transforms.Compose([transforms.ToTensor(),transforms.Normalize(mean[args.dataset], std[args.dataset])])
-    if args.dataset == "mnist":
-        traindataset = datasets.MNIST('../data', train=True, download=True,transform=transform)
-        testdataset = datasets.MNIST('../data', train=False, transform=transform)
-        from archs.mnist import AlexNet, advanced_dropout_fc, LeNet5, fc1, vgg, resnet
-        split = [55000, 5000]
-
-    elif args.dataset == "cifar10":
-        traindataset = datasets.CIFAR10('../data', train=True, download=True,transform=transform)
-        testdataset = datasets.CIFAR10('../data', train=False, transform=transform)      
-        from archs.cifar10 import AlexNet, LeNet5, fc1, vgg, resnet, densenet
-        split = [45000, 5000]
-
-    elif args.dataset == "fashionmnist":
-        traindataset = datasets.FashionMNIST('../data', train=True, download=True,transform=transform)
-        testdataset = datasets.FashionMNIST('../data', train=False, transform=transform)
-        from archs.mnist import AlexNet, LeNet5, fc1, vgg, resnet 
-
-    elif args.dataset == "cifar100":
-        traindataset = datasets.CIFAR100('../data', train=True, download=True,transform=transform)
-        testdataset = datasets.CIFAR100('../data', train=False, transform=transform)   
-        from archs.cifar100 import AlexNet, fc1, LeNet5, vgg, resnet  
-    
-    # If you want to add extra datasets paste here
-
-    else:
-        print("\nWrong Dataset choice \n")
-        exit()
-
-    train_dataset, val_dataset = torch.utils.data.random_split(traindataset, split, generator=torch.Generator().manual_seed(args.seed))
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
-    #train_loader = cycle(train_loader)
-    test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=4,drop_last=True)
-    
-    # Importing Network Architecture
-    global model
-    if args.arch_type == "fc1":
-        model = fc1.fc1().to(device)
-    elif args.arch_type == "advanced_dropout_fc":
-        model = advanced_dropout_fc.advanced_drop_fc().to(device)
-    elif args.arch_type == "lenet5":
-        model = LeNet5.LeNet5().to(device)
-    elif args.arch_type == "alexnet":
-        model = AlexNet.AlexNet().to(device)
-    elif args.arch_type == "vgg16":
-        model = vgg.vgg16().to(device)  
-    elif args.arch_type == "resnet18":
-        model = resnet.resnet18().to(device)   
-    elif args.arch_type == "densenet121":
-        model = densenet.densenet121().to(device)   
-    # If you want to add extra model paste here
-    else:
-        print("\nWrong Model choice\n")
-        exit()
-    step = 0
-    for name, param in model.named_parameters(): 
-        if 'weight' in name:
-            step = step + 1
-    mask = [None]* step 
-    # Weight Initialization
-    model.apply(weight_init)
-
-
-    # Copying and Saving Initial State
-    initial_state_dict = copy.deepcopy(model.state_dict())
-    torch.save(model, os.path.join(save_path, "initial_state_dict_{args.retrain_type}.pt"))
-    # Optimizer and Loss
-    if args.optimizer == 'adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    elif args.optimizer == 'sgd':
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
-    else:
-        raise Exception('wrong optimizer, has to be adam or sgd')
-    criterion = nn.CrossEntropyLoss() # Default was F.nll_loss
-
-    # Layer Looper
-    for name, param in model.named_parameters():
-        print(name, param.size())
-
-    # Pruning
-    # NOTE First Pruning args.prune_rounds is of No Compression
-    bestacc = 0.0
-    best_accuracy = 0
-    comp = np.zeros(args.prune_rounds,float)
-    bestacc = np.zeros(args.prune_rounds,float)
-    testacc = np.zeros(args.prune_rounds, float)
-    sparsity_ = np.zeros(args.prune_rounds, float)
-    step = 0
-    all_loss = np.zeros(args.train_epochs,float)
-    all_accuracy = np.zeros(args.train_epochs,float)
-    early_stop_trigger = 0
-
-    parameters_to_prune = []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
-            # if name == 'conv1':
-            #     if args.prune_conv1:
-            #         parameters_to_prune.append((module, 'weight'))
-            #     else:
-            #         print('skip the first conv2d for L1 unstructure global pruning')
-            # else:
-            parameters_to_prune.append((module, 'weight'))
-    parameters_to_prune = tuple(parameters_to_prune)
+torch.cuda.manual_seed_all(args.seed)
+class Proposed_prune():
+    def __init__(self, args) -> None:
+        self.device = args.device
+        self.batch_size = args.batch_size
+        self.train_epochs = args.train_epochs
+        self.args = args
+        self.counters = 1
+        if self.args.dataset == "cifar10":
+            num_classes = 10
+        elif self.args.dataset == "cifar100":
+            num_classes = 100
+        elif self.args.dataset == "imagenet":
+            num_classes = 1000
+        elif self.args.dataset == "tinyimagenet":
+            num_classes = 200
+        if args.arch_type == "fc":
+            self.model = fc1.fc1().to(self.device)
+            args.lr = 0.1
+            args.weight_decay = 0.0005
+            args.batch_size = 128
+            args.momentum = 0.9
+            args.train_epochs = 160
+        elif args.arch_type == "lenet5":
+            self.model = LeNet5.LeNet5().to(self.device)
+            args.lr = 0.1
+            args.weight_decay = 0.0005
+            args.batch_size = 128
+            args.momentum = 0.9
+            args.train_epochs = 160
+        elif args.arch_type == "vgg19":
+            self.model = vgg.vgg19_bn(num_classes=num_classes).to(self.device)
+            # self.model = vgg.VGG(depth=19, dataset=args.dataset, batchnorm=True).to(self.device)
+            args.lr = 0.1
+            args.weight_decay = 0.0005
+            args.momentum = 0.9
+        elif args.arch_type == "resnet50":
+            # self.model = resnet.ResNet50(num_classes=num_classes).to(self.device)
+            self.model = resnet.resnet(depth=50, dataset=args.dataset).to(self.device)
+            args.lr = 0.1
+            args.weight_decay = 0.0005
+            args.momentum = 0.9
+        else:
+            print("\nWrong Model choice\n")
+            exit()
+        ### load data ###
+        data = Data(args.seed)
+        if args.val_set == True:
+            train_dataset, val_dataset, testdataset = data.get_dataset(dataset=args.dataset, val=args.val_set)
+            self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
+            self.val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
+            self.test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=4,drop_last=False)
+        else:
+            train_dataset, testdataset = data.get_dataset(dataset=args.dataset, val=args.val_set)
+            self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,drop_last=False)
+            self.test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=4,drop_last=False)
         
-    for prune_round in range(args.start_prune_prune_round, args.prune_rounds):
-        if not prune_round == 0: # don't prune for the first running prune_round, because we want the model to be well trained before we prune it.
-            print(prune_round)
-            # prune_percent_each_prune_round = np.power(args.prune_percent, 1/args.prune_rounds) * 0.01 # p^(1/n) %
-            # prune_percent_each_prune_round = args.prune_percent * 0.01 / args.prune_rounds 
-            prune_by_percentile(args.prune_percent * 0.01, parameters_to_prune)
-            mask = get_mask(mask, model)
-            if reinit:
-                model.apply(weight_init)
-                step = 0
-                for name, param in model.named_parameters():
-                    if 'weight' in name:
-                        weight_dev = param.device
-                        param.data = (param.data * mask[step]).to(weight_dev)
-                        step = step + 1
-                step = 0
-            else:
-                original_initialization(mask, initial_state_dict)
-            if args.optimizer == 'adam':
-                optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            elif args.optimizer == 'sgd':
-                optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
-            else:
-                raise Exception('wrong optimizer, has to be adam or sgd')
-        print(f"\n--- Pruning Level [{ITE}:{prune_round}/{args.prune_rounds}]: ---")
+        self.prune_rate_decay = CosineDecay(prune_rate=args.prune_rate, T_max=len(self.train_loader)*self.train_epochs)
+        self.add_rate_decay = CosineDecay(prune_rate=1., T_max=len(self.train_loader)*self.train_epochs)
+        self.parameters_to_prune = []
+        self.initial_num_weights = []
+        self.importance_scores_prune = {} 
+        self.importance_scores_add = {}
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                if name == 'conv1' or name == 'features.0':
+                    if args.prune_conv1:
+                        self.parameters_to_prune.append((module, 'weight'))
+                    else:
+                        print('skip the first conv2d for L1 unstructure global pruning')
+                else:
+                    self.parameters_to_prune.append((module, 'weight'))
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                self.initial_num_weights.append(module.weight.numel())
+                if module.bias is not None:
+                    self.initial_num_weights.append(module.bias.numel())
+        self.initial_num_weights = np.array(self.initial_num_weights)
+        print(self.initial_num_weights)
+        self.parameters_to_prune = tuple(self.parameters_to_prune)
+        self.iter_per_epoch = len(self.train_loader)
+        print("iteration per epoch: ", self.iter_per_epoch)
+        self.total_iter = len(self.train_loader) * args.train_epochs
+        if self.args.init_type == "ERK":
+            # adapted from GraNet's code https://github.com/VITA-Group/GraNet 
+            is_epsilon_valid = False
+            erk_power_scale = 1.0
+            dense_layers = set()
 
+            while not is_epsilon_valid:
+
+                divisor = 0
+                rhs =  0
+                raw_probabilities = {}
+                for name, module in self.model.named_modules():
+                    if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                        n_param = np.prod(module.weight.shape)
+                        n_zeros = n_param * (1 - self.args.initial_ratio * 0.01)
+                        n_ones = n_param * self.args.initial_ratio * 0.01
+
+                        if name in dense_layers:
+                            rhs -= n_zeros
+
+                        else:
+                            rhs += n_ones
+                            raw_probabilities[name] = (
+                                np.sum(module.weight.shape) / np.prod(module.weight.shape)
+                            ) ** erk_power_scale
+                            divisor += raw_probabilities[name] * n_param
+                epsilon = rhs / divisor
+                max_prob = np.max(list(raw_probabilities.values()))
+                max_prob_one = max_prob * epsilon
+                if max_prob_one > 1:
+                    is_epsilon_valid = False
+                    for mask_name, mask_raw_prob in raw_probabilities.items():
+                        if mask_raw_prob == max_prob:
+                            print(f"Sparsity of var:{mask_name} had to be set to 0.")
+                            dense_layers.add(mask_name)
+                else:
+                    is_epsilon_valid = True
+            density_dict = {}
+            total_nonzero = 0.0
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                    n_param = np.prod(module.weight_mask.shape)
+                    if name in dense_layers:
+                        density_dict[name] = 1.0
+                    else:
+                        probability_one = epsilon * raw_probabilities[name]
+                        density_dict[name] = probability_one
+                    print(
+                            f"layer: {name}, shape: {module.weight_mask.shape}, nnz_ratio: {density_dict[name]}"
+                        )
+                    module.weight_mask = (torch.rand(module.weight_mask.shape) < density_dict[name]).float().data.to(self.args.device)
+                    total_nonzero += density_dict[name] * module.weight_mask.numel()
+
+            print(f"Overall sparsity {total_nonzero / self.initial_num_weights.sum()}")
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                    module.weight *= module.weight_mask
+
+        
+        self.save_path = f"{os.getcwd()}/saves/{args.method}/{args.dataset}/{args.arch_type}_initial_ratio_{args.initial_ratio}_{args.prune_dist}_{args.prune_criterion}_{args.add_criterion}_target_ratio_{args.target_ratio}_seed_{args.seed}/"
+        self.plot_path = f"{os.getcwd()}/plots/{args.method}/{args.dataset}/{args.arch_type}_initial_ratio_{args.initial_ratio}_{args.prune_dist}_{args.prune_criterion}_{args.add_criterion}_target_ratio_{args.target_ratio}_seed_{args.seed}/"
+        utils.checkdir(self.save_path)
+        utils.checkdir(self.plot_path)
+        with open(os.path.join(self.save_path, "args.yaml"), 'w') as f:
+            for arg in vars(args):
+                print('%s: %s' %(arg, getattr(args, arg)), file=f) 
+        print('Config -----')
+        for arg in vars(args):
+            print('%s: %s' %(arg, getattr(args, arg)))
+        print('------------')
+    
+    def prune(self, ):
+        writer = SummaryWriter(self.save_path)
+        criterion = nn.CrossEntropyLoss()
+        if args.optimizer == 'adam':
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        elif args.optimizer == 'sgd':
+            optimizer = torch.optim.SGD(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum, nesterov=True)
+        else:
+            raise Exception('wrong optimizer, has to be adam or sgd')
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[int(args.train_epochs / 2), int(args.train_epochs * 3 / 4)], last_epoch=-1)
+        bestacc = 0.0
+        best_accuracy = 0
+        test_accuracy = 0.0
+        train_epochs = args.train_epochs
+        comp = np.zeros(train_epochs,float)
+        bestacc = np.zeros(train_epochs,float)
+        testacc = np.zeros(train_epochs, float)
+        sparsity_ = np.zeros(train_epochs, float)
+        all_loss = np.zeros(train_epochs,float)
+        valacc = np.zeros(train_epochs,float)
+        early_stop_trigger = 0
         # Print the table of Nonzeros in each layer
-        comp1 = utils.print_nonzeros(model, writer, prune_round)
-        sparsity = round(float(100.0 - comp1), 1)
-        sparsity_[prune_round] = sparsity
-        comp[prune_round] = comp1
+        comp1 = utils.print_nonzeros(self.model.named_modules(), self.save_path, 0)
+        sparsity = round(100.0-comp1, 1)
+        sparsity_[0] = sparsity
+        comp[0] = comp1
         pbar = tqdm(range(args.train_epochs))
-
-        for iter_ in pbar:
-
+        for train_epoch in pbar:
             # Frequency for Testing
-            if iter_ % args.valid_freq == 0:
-                val_accuracy = test(model, val_loader, criterion)
-                writer.add_scalar(f'{prune_round}/valacc', val_accuracy, iter_)
+            if (train_epoch % args.valid_freq == 0) and (self.args.val_set == True):
+                val_accuracy = self.test(self.model, self.val_loader, criterion)
+
                 # Save Weights
                 if val_accuracy > best_accuracy:
                     best_accuracy = val_accuracy
-                    torch.save(model, os.path.join(save_path, "{prune_round}_model_{args.retrain_type}.pt"))
                     early_stop_trigger = 0
+                    torch.save(self.model, os.path.join(self.save_path, f"best_val_model_{args.prune_dist}.pt"))
                 else:
                     early_stop_trigger += 1
-
+                valacc[train_epoch] = val_accuracy
+            
             # Training
-            loss = train(model, train_loader, optimizer, criterion)
-            all_loss[iter_] = loss
-            all_accuracy[iter_] = val_accuracy
+            loss = self.train(self.model, self.train_loader, optimizer, criterion, train_epoch, self.args)
+            
+            if lr_scheduler is not None:
+                lr_scheduler.step()
+
+            all_loss[train_epoch] = loss
             # Frequency for Printing Accuracy and Loss
-            if iter_ % args.print_freq == 0:
+            if (train_epoch % args.print_freq == 0) and (self.args.val_set == True):
                 pbar.set_description(
-                    f'Train Epoch: {iter_}/{args.train_epochs} Loss: {loss:.6f} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
-            if early_stop_trigger > args.early_stop:
+                    f'Train Epoch: {train_epoch}/{args.train_epochs} LR: {optimizer.param_groups[-1]["lr"]} Loss: {loss:.6f} Prune rate: {self.prune_rate_decay.get_dr()} Val Accuracy: {val_accuracy:.2f}% Best Val Accuracy: {best_accuracy:.2f}%')       
+            else:
+                pbar.set_description(
+                    f'Train Epoch: {train_epoch}/{args.train_epochs} LR: {optimizer.param_groups[-1]["lr"]} Loss: {loss:.6f} Prune rate: {self.prune_rate_decay.get_dr()} Add rate: {self.add_rate_decay.get_dr()}')
+            if args.early_stop is not None and early_stop_trigger > args.early_stop:
                 break
-        best_val_model = torch.load(os.path.join(save_path, "{prune_round}_model_{args.retrain_type}.pt"))
-        test_accuracy = test(best_val_model, test_loader, criterion)
-        print(f'Test Accuracy: {test_accuracy}')
-        writer.add_scalar('Accuracy/val', best_accuracy, sparsity)
-        writer.add_scalar('Accuracy/test', test_accuracy, sparsity)
-        bestacc[prune_round] = best_accuracy
-        testacc[prune_round] = test_accuracy
-        fig = utils.plot_sparsity_testacc(sparsity_[:prune_round+1], testacc[:prune_round+1], plot_path)
-        writer.add_figure('sparsity_testacc', fig, prune_round)
-        # Plotting Loss (Training), Accuracy (Testing), args.prune_rounds Curve
-        #NOTE Loss is computed for every args.prune_rounds while Accuracy is computed only for every {args.valid_freq} args.prune_roundss. Therefore Accuracy saved is constant during the uncomputed args.prune_roundss.
-        #NOTE Normalized the accuracy to [0,100] for ease of plotting.
-        plt.plot(np.arange(1,(args.train_epochs)+1), 100*(all_loss - np.min(all_loss))/np.ptp(all_loss).astype(float), c="blue", label="Loss") 
-        plt.plot(np.arange(1,(args.train_epochs)+1), all_accuracy, c="red", label="Accuracy") 
-        plt.title(f"Loss Vs Accuracy Vs args.prune_roundss ({args.dataset},{args.arch_type}_lr_{args.lr})") 
-        plt.xlabel("args.prune_roundss") 
-        plt.ylabel("Loss and Accuracy") 
-        plt.legend() 
-        plt.grid(color="gray") 
-        plt.savefig(os.path.join(plot_path, "{args.retrain_type}_LossVsAccuracy_{comp1}.png"), dpi=1200) 
-        plt.close()
+            comp1 = utils.print_nonzeros(self.model.named_modules(), self.save_path, train_epoch)
+            sparsity_[train_epoch] = round(100.0 - comp1, 1)
+            
+            test_accuracy = self.test(self.model, self.test_loader, criterion)
 
-        # Dump Plot values
-        utils.checkdir(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}/{args.dataset}/")
-        all_loss.dump(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}/{args.dataset}/{args.retrain_type}_all_loss_{comp1}.dat")
-        all_accuracy.dump(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}/{args.dataset}/{args.retrain_type}_all_accuracy_{comp1}.dat")
+            print(f'Test Accuracy: {test_accuracy}')
+            writer.add_scalar('Accuracy_sparsity/val', best_accuracy, sparsity)
+            writer.add_scalar('Accuracy_sparsity/test', test_accuracy, sparsity)
+            writer.add_scalar('Accuracy_epoch/test', test_accuracy, train_epoch)
+            bestacc[0] = best_accuracy
+            testacc[train_epoch] = test_accuracy
+            fig_test = utils.plot_sparsity_testacc(sparsity_[20:train_epoch+1], testacc[20:train_epoch+1], self.plot_path, name='test')
+            fig_val = utils.plot_sparsity_testacc(sparsity_[20:train_epoch+1], valacc[20:train_epoch+1], self.plot_path, name='val')
+            writer.add_figure('sparsity_testacc', fig_test, train_epoch)
+            writer.add_figure('sparsity_valacc', fig_val, train_epoch)
+            d = {'sparsity': sparsity_[: train_epoch+1], 'testacc': testacc[:train_epoch+1]}
+            df = pd.DataFrame(data=d)
+            df.to_csv(f"{self.save_path}/sparsity_vs_testacc.csv", index=False)
+            torch.cuda.empty_cache()
+        # torch.save(self.model, os.path.join(self.save_path, f"final_model_{args.prune_dist}.pt"))
+        for name, module in self.model.named_modules():
+                if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                    prune.remove(module, 'weight')
+        save_checkpoint({
+        'epoch': (train_epoch + 1),
+        'state_dict': self.model.state_dict(),
+        'final_acc': test_accuracy,
+        'optimizer': optimizer.state_dict(),
+            }, self.save_path + 'model_final.pth.tar')
+
+
+
+    def train(self, model, train_loader, optimizer, criterion, train_epoch, args):
+        metric = MeanMetric()
+        model.train()
+        for batch_idx, (imgs, targets) in enumerate(train_loader):
+            train_iter = train_epoch * len(self.train_loader) + batch_idx + 1
+            optimizer.zero_grad()
+            imgs, targets = imgs.to(self.device), targets.to(self.device)
+            output = model(imgs)
+            train_loss = criterion(output, targets)
+            train_loss.backward()
+            metric.update(train_loss.detach().cpu())
+            if train_iter % self.args.update_interval == 0:
+                if self.args.prune_criterion == "|gradw|":
+                    for module, _ in self.parameters_to_prune:
+                        self.importance_scores_prune.update({(module, 'weight'): module.weight_orig.grad * module.weight})
+                elif self.args.prune_criterion == "|w|":
+                    self.importance_scores_prune = None # as |w| is already the default
+                elif self.args.prune_criterion == "|grad|":
+                    for module, _ in self.parameters_to_prune:
+                        self.importance_scores_prune.update({(module, 'weight'): module.weight_orig.grad})
+                if self.args.add_criterion == "|grad|":
+                    for module, _ in self.parameters_to_prune:
+                        self.importance_scores_add.update({(module, 'weight'): module.weight_orig.grad})
+                elif self.args.add_criterion == "random" or self.args.add_criterion == "|w|":
+                    self.importance_scores_add = None
+            self.prune_rate_decay.step()
+            self.add_rate_decay.step()
+            optimizer.step() 
+            if train_iter <= int(self.args.end_update_iter_ratio * self.total_iter):
+                self.prune_and_reconnect(train_iter)
+        return metric.compute().item()
+
+    def test(self, model, test_loader, criterion):
+        model.eval()
+        test_loss = 0
+        correct = 0
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                output = model(data)
+                test_loss += criterion(output, target).item()  # sum up batch loss
+                pred = output.data.max(1, keepdim=True)[1]  # get the index of the max log-probability
+                correct += pred.eq(target.data.view_as(pred)).sum().item()
+            test_loss /= len(test_loader.dataset)
+            accuracy = 100. * correct / len(test_loader.dataset)
+        return accuracy
+    
+    def prune_and_reconnect(self, train_iter):
+        if train_iter % self.args.update_interval == 0:
+            if self.args.add_criterion == "random":
+                for name, module in self.model.named_modules():
+                    if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                        prune.remove(module, 'weight')
+                prune_ratio = 1. - self.schedule_function(train_iter)
+                add_ratio = self.prune_rate_decay.get_dr() * self.schedule_function(train_iter)
+                global_unstructure.global_unstructured(self.parameters_to_prune, pruning_method=Prune_and_Reconnect, amount_prune=prune_ratio+add_ratio, amount_add=add_ratio, importance_scores=self.importance_scores_prune)
+
+            elif self.args.add_criterion == "|grad|":
+                already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
+                prune_ratio = 1. - self.schedule_function(train_iter)
+                to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
+                remain = self.initial_num_weights.sum() - already_pruned.sum()
+                to_prune_t = to_prune
+                to_add_t = int((remain - to_prune_t) * self.prune_rate_decay.get_dr())
+                if self.args.prune_criterion == "|w|":
+                    global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_GradfromW_Add_Grad, amount_prune=(to_prune_t+to_add_t), amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
+            
+            elif self.args.add_criterion == "": # without adding criterion
+                already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
+                prune_ratio = 1 - self.schedule_function(train_iter)
+                if self.args.prune_criterion == "|gradw|":
+                    to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
+                    global_unstructure.global_unstructured(self.parameters_to_prune, pruning_method=prune.L1Unstructured, amount=to_prune,importance_scores=self.importance_scores_prune)
+                elif self.args.prune_criterion == "|w|":
+                    to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
+                    if self.args.prune_dist == "global":
+                        global_unstructure.global_unstructured(self.parameters_to_prune, pruning_method=prune.L1Unstructured, amount=to_prune,importance_scores=self.importance_scores_prune)
+                    elif self.args.prune_dist == "local":
+                        to_prune = self.schedule_function(train_iter - self.args.update_interval) - self.schedule_function(train_iter)
+                        for module, _ in self.parameters_to_prune:
+                            global_unstructure.global_unstructured(tuple([(module, 'weight')]), pruning_method=prune.L1Unstructured, amount=int(to_prune * torch.numel(module.weight)), importance_scores=self.importance_scores_prune)
+                        
+            elif self.args.add_criterion == "|w|":
+                already_pruned = np.array([int(torch.count_nonzero(module.weight==0)) for name, module in self.model.named_modules() if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)])
+                prune_ratio = 1. - self.schedule_function(train_iter)
+                to_prune = int(np.floor((self.initial_num_weights.sum() * prune_ratio - already_pruned.sum())))
+                if self.args.prune_criterion == "|grad|":
+                    if train_iter > int(self.args.end_update_iter_ratio * self.total_iter):
+                        to_prune = 0
+                    remain = self.initial_num_weights.sum() - already_pruned.sum()
+                    to_add_t = int(self.args.select_ratio * remain) - to_prune
+                    to_prune_t = int(self.args.select_ratio * remain)
+                    if self.args.prune_dist == "global":
+                        global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(self.parameters_to_prune, pruning_method=Prune_WfromGrad_Add_Grad, amount_prune=to_prune_t, amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add)
+                    elif self.args.prune_dist == "local": 
+                        to_prune_t = to_prune_t / self.initial_num_weights.sum()
+                        to_add_t = to_add_t / self.initial_num_weights.sum()
+                        for module, name in self.parameters_to_prune:
+                            global_unstructure_double_importance_scores.global_unstructured_with_different_criteria(tuple([(module, 'weight')]), pruning_method=Prune_WfromGrad_Add_Grad, amount_prune=to_prune_t, amount_add=to_add_t, importance_scores_prune=self.importance_scores_prune, importance_scores_add=self.importance_scores_add) 
+                    
+
+            
+    def schedule_function(self, cur_iter, start_iter=0):
+        return self.args.target_ratio * 0.01 + 0.01*(self.args.initial_ratio - self.args.target_ratio)*(1 - ((cur_iter - start_iter)/(int(self.total_iter * self.args.end_update_iter_ratio))))**3
+    
+class CosineDecay(object):
+    def __init__(self, prune_rate, T_max, eta_min=0.005, last_epoch=-1):
+        self.sgd = torch.optim.SGD(torch.nn.ParameterList([torch.nn.Parameter(torch.zeros(1))]), lr=prune_rate)
+        self.cosine_stepper = torch.optim.lr_scheduler.CosineAnnealingLR(self.sgd, T_max, eta_min, last_epoch)
+
+    def step(self):
+        self.cosine_stepper.step()
+
+    def get_dr(self):
+        return self.sgd.param_groups[0]['lr']
+
+def save_checkpoint(state, filename='checkpoint.pth.tar'):
+    if os.path.isfile(filename):
+        os.remove(filename)
+    torch.save(state, filename)
+
+def main():
+    proposed_prune = Proposed_prune(args)
+    proposed_prune.prune()
+if __name__ == "__main__":
+    main()
+
         
-        # Dumping mask
-        utils.checkdir(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}/{args.dataset}/")
-        with open(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}/{args.dataset}/{args.retrain_type}_mask_{comp1}.pkl", 'wb') as fp:
-            pickle.dump(mask, fp)
-        
-        # Making variables into 0
-        best_accuracy = 0
-        all_loss = np.zeros(args.train_epochs,float)
-        all_accuracy = np.zeros(args.train_epochs,float)
 
-    # Dumping Values for Plotting
-    utils.checkdir(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}/{args.dataset}/")
-    comp.dump(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}/{args.dataset}/{args.retrain_type}_compression.dat")
-    bestacc.dump(f"{os.getcwd()}/dumps/lt/{args.arch_type}_lr_{args.lr}/{args.dataset}/{args.retrain_type}_bestaccuracy.dat")
-
-    # Plotting
-    a = np.arange(args.prune_rounds)
-    plt.plot(a, bestacc, c="blue", label="Winning tickets") 
-    plt.title(f"Test Accuracy vs Unpruned Weights Percentage ({args.dataset},{args.arch_type}_lr_{args.lr})") 
-    plt.xlabel("Unpruned Weights Percentage") 
-    plt.ylabel("test accuracy") 
-    plt.xticks(a, comp, rotation ="vertical") 
-    plt.ylim(0,100)
-    plt.legend() 
-    plt.grid(color="gray") 
-    utils.checkdir(f"{os.getcwd()}/plots/lt/{args.arch_type}_lr_{args.lr}/{args.dataset}/")
-    plt.savefig(f"{os.getcwd()}/plots/lt/{args.arch_type}_lr_{args.lr}/{args.dataset}/{args.retrain_type}_AccuracyVsWeights.png", dpi=1200) 
-    plt.close()                    
-   
-# Function for Training
-def train(model, train_loader, optimizer, criterion):
-    EPS = 1e-6
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.train()
-    for batch_idx, (imgs, targets) in enumerate(train_loader):
-        optimizer.zero_grad()
-        #imgs, targets = next(train_loader)
-        imgs, targets = imgs.to(device), targets.to(device)
-        output = model(imgs)
-        train_loss = criterion(output, targets)
-        train_loss.backward()
-
-        # Freezing Pruned weights by making their gradients Zero
-        for name, p in model.named_parameters():
-            if 'weight' in name:
-                tensor = p.data
-                grad_tensor = p.grad.data
-                grad_tensor = torch.where(torch.abs(tensor) < EPS, 0, grad_tensor)
-                p.grad.data = grad_tensor.to(device)
-
-        optimizer.step()
-    return train_loss.item()
-
-# Function for Testing
-def test(model, test_loader, criterion):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.eval()
-    test_loss = 0
-    correct = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
-            pred = output.data.max(1, keepdim=True)[1]  # get the index of the max log-probability
-            correct += pred.eq(target.data.view_as(pred)).sum().item()
-        test_loss /= len(test_loader.dataset)
-        accuracy = 100. * correct / len(test_loader.dataset)
-    return accuracy
-
-# Prune by Percentile module
-def prune_by_percentile(prune_percent, parameters_to_prune):
-    if args.prune_type == 'local':
-        i = 0
-        for layer, name in parameters_to_prune:
-            i += 1
-            if i != len(parameters_to_prune):
-                prune.l1_unstructured(layer, name=name, amount=prune_percent)
-            else:
-                # prune at half ratio for the last output layer
-                prune.l1_unstructured(layer, name=name, amount=prune_percent/2)
-    elif args.prune_type == 'global':
-        prune.global_unstructured(parameters_to_prune, pruning_method=prune.L1Unstructured, amount=prune_percent)
-
-def original_initialization(mask_temp, initial_state_dict):
-    global model
-    
-    step = 0
-    for name, param in model.named_parameters(): 
-        if "weight" in name: 
-            weight_dev = param.device
-            # param.data = torch.from_numpy(mask_temp[step] * initial_state_dict[name].cpu().numpy()).to(weight_dev)
-            param.data = (mask_temp[step] * initial_state_dict[name[:-5]]).to(weight_dev)
-            step = step + 1
-        if "bias" in name:
-            param.data = initial_state_dict[name]
-    step = 0
-
-# Function for Initialization
-def weight_init(m):
-    '''
-    Usage:
-        model = Model()
-        model.apply(weight_init)
-    '''
-    if isinstance(m, nn.Conv1d):
-        init.normal_(m.weight.data)
-        if m.bias is not None:
-            init.normal_(m.bias.data)
-    elif isinstance(m, nn.Conv2d):
-        init.xavier_normal_(m.weight.data)
-        if m.bias is not None:
-            init.normal_(m.bias.data)
-    elif isinstance(m, nn.Conv3d):
-        init.xavier_normal_(m.weight.data)
-        if m.bias is not None:
-            init.normal_(m.bias.data)
-    elif isinstance(m, nn.ConvTranspose1d):
-        init.normal_(m.weight.data)
-        if m.bias is not None:
-            init.normal_(m.bias.data)
-    elif isinstance(m, nn.ConvTranspose2d):
-        init.xavier_normal_(m.weight.data)
-        if m.bias is not None:
-            init.normal_(m.bias.data)
-    elif isinstance(m, nn.ConvTranspose3d):
-        init.xavier_normal_(m.weight.data)
-        if m.bias is not None:
-            init.normal_(m.bias.data)
-    elif isinstance(m, nn.BatchNorm1d):
-        init.normal_(m.weight.data, mean=1, std=0.02)
-        init.constant_(m.bias.data, 0)
-    elif isinstance(m, nn.BatchNorm2d):
-        init.normal_(m.weight.data, mean=1, std=0.02)
-        init.constant_(m.bias.data, 0)
-    elif isinstance(m, nn.BatchNorm3d):
-        init.normal_(m.weight.data, mean=1, std=0.02)
-        init.constant_(m.bias.data, 0)
-    elif isinstance(m, nn.Linear):
-        init.xavier_normal_(m.weight.data)
-        init.normal_(m.bias.data)
-    elif isinstance(m, nn.LSTM):
-        for param in m.parameters():
-            if len(param.shape) >= 2:
-                init.orthogonal_(param.data)
-            else:
-                init.normal_(param.data)
-    elif isinstance(m, nn.LSTMCell):
-        for param in m.parameters():
-            if len(param.shape) >= 2:
-                init.orthogonal_(param.data)
-            else:
-                init.normal_(param.data)
-    elif isinstance(m, nn.GRU):
-        for param in m.parameters():
-            if len(param.shape) >= 2:
-                init.orthogonal_(param.data)
-            else:
-                init.normal_(param.data)
-    elif isinstance(m, nn.GRUCell):
-        for param in m.parameters():
-            if len(param.shape) >= 2:
-                init.orthogonal_(param.data)
-            else:
-                init.normal_(param.data)
-
-def get_mask(mask, model):
-    step = 0
-    for module in model.children():
-        mask[step] = list(module.named_buffers())[0][1].cuda()
-        step += 1 
-    return mask
-
-
-if __name__=="__main__":
-    
-    # from gooey import Gooey
-    # @Gooey      
-    
-    # Arguement Parser
-
-    #FIXME resample
-    resample = False
-
-    # Looping Entire process
-    #for i in range(0, 5):
-    main(args, ITE=1)
