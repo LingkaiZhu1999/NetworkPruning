@@ -68,6 +68,7 @@ parser.add_argument("--moving-average-alpha", default=0.5, type=float)
 parser.add_argument("--update-interval", type=int, default=2000)
 parser.add_argument("--init-type", type=str, default="")
 parser.add_argument("--select-ratio", type=float, default=0.5)
+parser.add_argument("--label-smoothing", type=float, default=0.1)
 parser.add_argument("--seed", default=1, type=int)
 args = parser.parse_args()
 
@@ -279,7 +280,7 @@ class Proposed_prune():
     
     def prune(self, ):
         writer = SummaryWriter(self.save_path)
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(label_smoothing=self.args.label_smoothing)
         if args.optimizer == 'adam':
             optimizer = torch.optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         elif args.optimizer == 'sgd':
